@@ -1,0 +1,4 @@
+name = "world-of-discoveries-ai"
+main = "workers.js"
+compatibility_date = "2026-06-01"
+keep_vars = true
