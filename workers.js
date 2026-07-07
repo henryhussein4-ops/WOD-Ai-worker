@@ -584,9 +584,9 @@ function buildWarning(u, cfg, isAdmin) {
 }
 
 function providerMaxTokens(perms, affordableChars) {
-  const planMax = perms.maxResponseTokens || 800;
+  const planMax = Math.max(300, perms.maxResponseTokens || 800);
   if (affordableChars === Infinity) return planMax;
-  return Math.max(64, Math.min(planMax, Math.floor(affordableChars / 4)));
+  return Math.max(300, Math.min(planMax, Math.floor(affordableChars / 4)));
 }
 
 async function notifyLimit(env, uid, cfg, message) {
