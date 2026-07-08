@@ -2625,6 +2625,80 @@ export default {
           });
         }
 
+        case "/skills/all": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          let node = null;
+          try { node = await fbGet(env, "dockSkills"); } catch (e) {}
+          const out = [];
+          if (node) {
+            for (const k of Object.keys(node)) {
+              const s = node[k] || {};
+              out.push({
+                key: k,
+                name: (typeof s === "string" ? k : (s.name || k)),
+                keywords: (typeof s === "string" ? "" : String(s.keywords || "")),
+                content: (typeof s === "string" ? s : String(s.content || "")),
+                enabled: (typeof s === "string" ? true : s.enabled !== false),
+                updatedAt: (typeof s === "string" ? 0 : (s.updatedAt || 0))
+              });
+            }
+          }
+          out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          return json({ ok: true, enabled: !!cfg.dockSkillsEnabled, skills: out });
+        }
+
+        case "/skills/save": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          const name = String(body.name || "").trim().slice(0, 80);
+          const content = String(body.content || "").trim();
+          if (!name) return json(friendly("A skill name is required."), 400);
+          if (!content) return json(friendly("Skill content is required."), 400);
+          let key = String(body.key || "").trim();
+          if (!key) key = safeKey(name.toLowerCase().replace(/\s+/g, "-")).slice(0, 60) || newId();
+          const rec = {
+            name,
+            keywords: String(body.keywords || "").trim().slice(0, 400),
+            content: content.slice(0, 12000),
+            enabled: body.enabled !== false,
+            updatedAt: nowMs()
+          };
+          await fbSet(env, `dockSkills/${safeKey(key)}`, rec);
+          return json({ ok: true, key: safeKey(key), skill: rec });
+        }
+
+        case "/skills/toggle": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          const key = safeKey(body.key || "");
+          if (!key) return json(friendly("Which skill?"), 400);
+          const cur = await fbGet(env, `dockSkills/${key}`);
+          if (!cur) return json(friendly("That skill was not found."), 404);
+          const rec = (typeof cur === "string")
+            ? { name: key, keywords: "", content: cur, enabled: false, updatedAt: nowMs() }
+            : Object.assign({}, cur, { enabled: body.enabled !== false, updatedAt: nowMs() });
+          await fbSet(env, `dockSkills/${key}`, rec);
+          return json({ ok: true, key, enabled: rec.enabled });
+        }
+
+        case "/skills/delete": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          const key = safeKey(body.key || "");
+          if (!key) return json(friendly("Which skill?"), 400);
+          await fbDelete(env, `dockSkills/${key}`);
+          return json({ ok: true });
+        }
+
+        case "/skills/test": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          const message = String(body.message || "").trim();
+          if (!message) return json(friendly("Type a test message."), 400);
+          const flags = deriveFlags(message, {});
+          const matched = await getSkillsFor(env, cfg, cfg.paidPerms, message, flags);
+          return json({
+            ok: true, flags,
+            matched: matched.map(s => ({ key: s.key, name: s.name }))
+          });
+        }
+
         case "/memory/update": return await memoryUpdate(env, cfg, uid, u, body);
         case "/memory/chat-update": return await chatMemoryUpdate(env, cfg, uid, u, body);
 
