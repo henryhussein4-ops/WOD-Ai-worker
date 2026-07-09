@@ -2510,7 +2510,7 @@ async function handleVision(env, cfg, uid, u, body) {
     frames = frames.slice(0, cfg.maxImagesPerMessage || 4);
   }
 
-  const prompt = kind === "camera"
+  let prompt = kind === "camera"
     ? "These are live camera frames in time order. Tell the user what you see happening right now, naturally, as if watching live. Question: " + String(body.message || "What do you see?")
     : kind === "video"
       ? "These are frames from a short video in time order. Describe what happens across the video. Question: " + String(body.message || "What happens in this video?")
