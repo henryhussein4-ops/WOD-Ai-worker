@@ -1,4 +1,7 @@
 name = "world-of-discoveries-ai"
 main = "workers.js"
-compatibility_date = "2026-06-01"
-keep_vars = true
+account_id = "136166961def9d1dc2fc964de09111a3"
+compatibility_date = "2025-01-01"
+
+[ai]
+binding = "AI"
