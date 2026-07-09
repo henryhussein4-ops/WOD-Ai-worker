@@ -82,6 +82,7 @@ const DEFAULT_CONFIG = {
   searchFirst: "kmh",
   researchSourcesFree: 10,
   researchSourcesPaid: 90,
+  videosEnabled: true,
 
   generalSearchWorker: "https://withered-cake-aa88.zeemar256.workers.dev/",
   newsSearchWorker: "https://curly-band-5b64.imzeeworld.workers.dev/",
@@ -679,7 +680,8 @@ async function loadDockSkills(env) {
       key: k, name: s.name || k,
       keywords: String(s.keywords || s.name || k),
       content: String(s.content || s.text || ""),
-      enabled: s.enabled !== false
+      enabled: s.enabled !== false,
+      mandatory: s.mandatory === true
     });
   }
   return skills.filter(s => s.enabled && s.content);
@@ -732,7 +734,56 @@ async function getSkillsFor(env, cfg, perms, message, flags) {
   if (!cfg.dockSkillsEnabled) return [];
   const all = await loadDockSkills(env);
   if (!all.length) return [];
-  return matchDockSkills(all, message, flags, cfg);
+  const mandatory = all.filter(s => s.mandatory);
+  const matched = matchDockSkills(all.filter(s => !s.mandatory), message, flags, cfg);
+  return mandatory.concat(matched);
+}
+
+function wantsVideos(m) {
+  const t = String(m || "").toLowerCase();
+  return /\b(videos?|youtube)\b/.test(t) && /\b(pull|show|give|find|get|watch|play|send|share|recommend|suggest|some|any|a)\b/.test(t);
+}
+
+function ytIdFrom(url) {
+  const u = String(url || "");
+  let m = u.match(/[?&]v=([A-Za-z0-9_-]{6,15})/);
+  if (m) return m[1];
+  m = u.match(/youtu\.be\/([A-Za-z0-9_-]{6,15})/);
+  if (m) return m[1];
+  m = u.match(/youtube\.com\/(?:embed|shorts)\/([A-Za-z0-9_-]{6,15})/);
+  if (m) return m[1];
+  return null;
+}
+
+async function findYouTubeVideos(env, cfg, query, n) {
+  const clean = String(query || "").replace(/\b(pull|show|give|find|get|send|share|recommend|suggest|me|some|any|videos?|youtube|about|of|for|on|please|can|you)\b/gi, " ").replace(/\s+/g, " ").trim();
+  const q = (clean || String(query).slice(0, 80)) + " youtube video";
+  const seen = new Set();
+  const out = [];
+  const r = await searchWeb(env, cfg, q.slice(0, 110), 10);
+  if (r.ok) {
+    for (const it of r.results) {
+      const id = ytIdFrom(it.url || "");
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        out.push({
+          title: (it.title || "YouTube video").slice(0, 120),
+          url: "https://www.youtube.com/watch?v=" + id,
+          videoId: id,
+          thumb: "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg"
+        });
+      }
+      if (out.length >= (n || 5)) break;
+    }
+  }
+  return out;
+}
+
+async function notifPush(env, uid, obj) {
+  try {
+    obj.at = nowMs();
+    await fbSet(env, `notif/${uid}/${newId()}`, obj);
+  } catch (e) {}
 }
 
 function scoreComplexity(msg) {
@@ -1992,22 +2043,18 @@ async function handleChat(env, cfg, uid, u, body, email) {
   let usedNews = false;
   if (skillText) contextBlocks.push(skillText);
 
-  const profB = await profileBlock(env, cfg, uid, email, body.localTime);
+  const [profB, mems, cmNode] = await Promise.all([
+    profileBlock(env, cfg, uid, email, body.localTime),
+    relevantMemories(env, cfg, uid, message),
+    body.chatId ? fbGet(env, `chatMem/${uid}/${safeKey(body.chatId)}`).catch(() => null) : Promise.resolve(null)
+  ]);
   if (profB) contextBlocks.push(profB);
-
-  const mems = await relevantMemories(env, cfg, uid, message);
-  let chatSummary = null;
-  if (body.chatId) {
-    try {
-      const cm = await fbGet(env, `chatMem/${uid}/${safeKey(body.chatId)}`);
-      if (cm && cm.summary) chatSummary = cm.summary;
-    } catch (e) {}
-  }
+  const chatSummary = (cmNode && cmNode.summary) ? cmNode.summary : null;
   const memB = memoryBlock(mems, chatSummary);
   if (memB) contextBlocks.push(memB);
 
   const kmhFirst = (cfg.searchFirst || "kmh") === "kmh";
-  const wantsCurrent = needsCurrentInfo(message) || looksUnsure(message);
+  const wantsCurrent = needsCurrentInfo(message);
   const newsWanted = isNewsQuery(message);
   const geminiMode = mode.provider === "gemini";
 
@@ -2047,6 +2094,15 @@ async function handleChat(env, cfg, uid, u, body, email) {
     if (!hit) await tryKmh();
   }
 
+  let videos = [];
+  if (cfg.videosEnabled !== false && wantsVideos(message) && canSearch(u, cfg, perms)) {
+    videos = await findYouTubeVideos(env, cfg, message, 5);
+    if (videos.length) {
+      u.searchesUsed = (u.searchesUsed || 0) + 1;
+      contextBlocks.push("The app will show these YouTube videos as tappable cards under your reply. Mention them naturally and briefly, do not paste links:\n" + videos.map((v, i) => (i + 1) + ". " + v.title).join("\n"));
+    }
+  }
+
   const sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"))
     + "\n\nSCREEN ISOLATION LAW: This is the general chat. Never mention, invent, or discuss Marketplace business listings or News-screen articles here. Each screen of the app has its own separate context.";
   const messages = [{ role: "system", content: sysP }];
@@ -2080,12 +2136,14 @@ async function handleChat(env, cfg, uid, u, body, email) {
   });
   await saveUser(env, uid, u);
 
+  const cScore = scoreComplexity(message);
   return json({
     ok: true, text: budget.text, cut: budget.cut,
     message: budget.cut ? budget.cutMessage : null,
     provider: result.provider, model: result.model,
-    sources, usedNews, notice, banner: cfg.banner || "",
+    sources, usedNews, videos, notice, banner: cfg.banner || "",
     skillsRead: skills.map(s => s.name),
+    taskLevel: cScore >= 5 ? "tough" : (cScore >= 3 ? "medium" : "simple"),
     warning: buildWarning(u, cfg, isAdmin)
   });
 }
@@ -2311,12 +2369,16 @@ async function handleMarketAdd(env, cfg, uid, u, body) {
   return json({ ok: true, listingId: id });
 }
 
-function listingPublic(id, l, withImages) {
+function listingPublic(id, l, withImages, uid) {
   return {
     id, name: l.name, description: l.description, location: l.location,
     phone: l.phone, email: l.email, whatsapp: l.whatsapp, facebook: l.facebook,
     socials: l.socials, category: l.category, owner: l.owner,
     images: withImages ? (l.images || []) : ((l.images || []).slice(0, 1)),
+    likeCount: l.likes ? Object.keys(l.likes).length : 0,
+    commentCount: l.comments ? Object.keys(l.comments).length : 0,
+    viewCount: l.views ? Object.keys(l.views).length : 0,
+    likedByMe: !!(uid && l.likes && l.likes[uid]),
     createdAt: l.createdAt
   };
 }
@@ -2332,15 +2394,18 @@ async function handleMarketList(env, cfg, uid, body) {
   const filtered = mineOnly ? all.filter(x => x.l.uid === uid) : all;
   const cat = String(body.category || "").toLowerCase();
   const catFiltered = cat ? filtered.filter(x => String(x.l.category || "").toLowerCase() === cat) : filtered;
-  const page = catFiltered.slice(0, 30).map(x => listingPublic(x.id, x.l, body.full === true));
+  const page = catFiltered.slice(0, 30).map(x => listingPublic(x.id, x.l, body.full === true, uid));
   return json({ ok: true, listings: page });
 }
 
-async function handleMarketGet(env, cfg, body) {
+async function handleMarketGet(env, cfg, uid, body) {
   const id = safeKey(body.listingId);
   const l = await fbGet(env, `market/${id}`);
   if (!l) return json(friendly("That business listing was not found."), 404);
-  return json({ ok: true, listing: listingPublic(id, l, true) });
+  if (uid && l.uid !== uid && !(l.views && l.views[uid])) {
+    try { await fbSet(env, `market/${id}/views/${uid}`, nowMs()); l.views = l.views || {}; l.views[uid] = 1; } catch (e) {}
+  }
+  return json({ ok: true, listing: listingPublic(id, l, true, uid) });
 }
 
 async function handleMarketDelete(env, cfg, uid, body) {
@@ -2639,6 +2704,7 @@ export default {
                 keywords: (typeof s === "string" ? "" : String(s.keywords || "")),
                 content: (typeof s === "string" ? s : String(s.content || "")),
                 enabled: (typeof s === "string" ? true : s.enabled !== false),
+                mandatory: (typeof s === "string" ? false : s.mandatory === true),
                 updatedAt: (typeof s === "string" ? 0 : (s.updatedAt || 0))
               });
             }
@@ -2660,6 +2726,7 @@ export default {
             keywords: String(body.keywords || "").trim().slice(0, 400),
             content: content.slice(0, 12000),
             enabled: body.enabled !== false,
+            mandatory: body.mandatory === true,
             updatedAt: nowMs()
           };
           await fbSet(env, `dockSkills/${safeKey(key)}`, rec);
@@ -2728,13 +2795,93 @@ export default {
         }
         case "/market/add": return await handleMarketAdd(env, cfg, uid, u, body);
         case "/market/list": return await handleMarketList(env, cfg, uid, body);
-        case "/market/get": return await handleMarketGet(env, cfg, body);
+        case "/market/get": return await handleMarketGet(env, cfg, uid, body);
         case "/market/delete": return await handleMarketDelete(env, cfg, uid, body);
         case "/market/ask": return await handleMarketAsk(env, cfg, uid, u, body);
         case "/news/feed": return await handleNewsFeed(env, cfg, uid, u, body);
         case "/news/ask": return await handleContextAsk(env, cfg, uid, u, body);
         case "/context/ask": return await handleContextAsk(env, cfg, uid, u, body);
         case "/nearby": return await handleNearby(env, cfg, uid, u, body, email);
+
+        case "/market/like": {
+          const id = safeKey(body.listingId || "");
+          const l = await fbGet(env, `market/${id}`);
+          if (!l) return json(friendly("That business listing was not found."), 404);
+          const had = !!(l.likes && l.likes[uid]);
+          if (had) {
+            await fbDelete(env, `market/${id}/likes/${uid}`);
+          } else {
+            await fbSet(env, `market/${id}/likes/${uid}`, nowMs());
+            if (l.uid && l.uid !== uid) {
+              let me = null;
+              try { me = await fbGet(env, `profiles/${uid}`); } catch (e) {}
+              await notifPush(env, l.uid, { type: "like", listingId: id, listingName: l.name || "", fromName: (me && me.name) || "A Zama user" });
+            }
+          }
+          let count = 0;
+          try { const fresh = await fbGet(env, `market/${id}/likes`); count = fresh ? Object.keys(fresh).length : 0; } catch (e) {}
+          return json({ ok: true, liked: !had, likeCount: count });
+        }
+
+        case "/market/comment": {
+          const id = safeKey(body.listingId || "");
+          const text = String(body.text || "").trim().slice(0, 400);
+          if (!text) return json(friendly("Write a comment first."), 400);
+          const l = await fbGet(env, `market/${id}`);
+          if (!l) return json(friendly("That business listing was not found."), 404);
+          let me = null;
+          try { me = await fbGet(env, `profiles/${uid}`); } catch (e) {}
+          const name = (me && me.name) || "Zama user";
+          await fbSet(env, `market/${id}/comments/${newId()}`, { uid, name, text, at: nowMs() });
+          if (l.uid && l.uid !== uid) {
+            await notifPush(env, l.uid, { type: "comment", listingId: id, listingName: l.name || "", fromName: name, text: text.slice(0, 80) });
+          }
+          return json({ ok: true });
+        }
+
+        case "/market/comments": {
+          const id = safeKey(body.listingId || "");
+          let node = null;
+          try { node = await fbGet(env, `market/${id}/comments`); } catch (e) {}
+          const out = [];
+          if (node) { for (const k of Object.keys(node)) { const c = node[k]; if (c && c.text) out.push({ name: c.name || "Zama user", text: c.text, at: c.at || 0, mine: c.uid === uid }); } }
+          out.sort((a, b) => (a.at || 0) - (b.at || 0));
+          return json({ ok: true, comments: out.slice(-50) });
+        }
+
+        case "/notif/list": {
+          let node = null, meta = null;
+          try { node = await fbGet(env, `notif/${uid}`); } catch (e) {}
+          try { meta = await fbGet(env, `notifMeta/${uid}`); } catch (e) {}
+          const lastSeen = (meta && meta.lastSeen) || 0;
+          const items = [];
+          if (node) { for (const k of Object.keys(node)) { const n = node[k]; if (n) items.push(Object.assign({ id: k }, n)); } }
+          items.sort((a, b) => (b.at || 0) - (a.at || 0));
+          if (items.length > 80) {
+            const kill = {};
+            items.slice(60).forEach(n => kill[n.id] = null);
+            try { await fbUpdate(env, `notif/${uid}`, kill); } catch (e) {}
+          }
+          const top = items.slice(0, 40);
+          const unseen = top.filter(n => (n.at || 0) > lastSeen).length;
+          return json({ ok: true, notifications: top, unseen });
+        }
+
+        case "/notif/seen": {
+          await fbSet(env, `notifMeta/${uid}`, { lastSeen: nowMs() });
+          return json({ ok: true });
+        }
+
+        case "/videos": {
+          const q = String(body.query || "").trim();
+          if (!q) return json(friendly("What videos should Zama find?"), 400);
+          const permsV = u.plan === "paid" ? cfg.paidPerms : cfg.freePerms;
+          if (!canSearch(u, cfg, permsV) && uid !== ADMIN_UID) return json(friendly("Search is resting until your usage reset."), 403);
+          const v = await findYouTubeVideos(env, cfg, q, Math.min(5, Number(body.count) || 5));
+          u.searchesUsed = (u.searchesUsed || 0) + 1;
+          await saveUser(env, uid, u);
+          return json({ ok: true, videos: v });
+        }
 
         case "/awd/save": return await handleAwdSave(env, cfg, uid, u, body);
         case "/asset/save": return await handleAssetSave(env, cfg, uid, u, body);
