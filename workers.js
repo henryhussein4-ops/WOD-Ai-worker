@@ -60,11 +60,11 @@ const DEFAULT_CONFIG = {
   maxFilesPerMessage: 5,
   maxVideosPerMessage: 1,
   maxAudioPerMessage: 2,
-  freeVideoSeconds: 10,
+  freeVideoSeconds: 15,
   paidVideoSeconds: 60,
   freeCameraSeconds: 15,
   paidCameraSeconds: 120,
-  maxVideoFrames: 8,
+  maxVideoFrames: 50,
 
   maxMemories: 200,
   memoryRetentionFreeDays: 7,
@@ -83,6 +83,26 @@ const DEFAULT_CONFIG = {
   researchSourcesFree: 10,
   researchSourcesPaid: 90,
   videosEnabled: true,
+  videoFreePerDay: 1,
+  cartesiaEnabled: true,
+  cartesiaModel: "sonic-2",
+  cartesiaVoice: "694f9389-aac1-45b6-b726-9d9369183238",
+  cartesiaVersion: "2025-04-16",
+  cartesiaKeys: [],
+  ttsDailyFree: 15, ttsDailyPaid: 300, ttsMaxChars: 500,
+  cfImageEnabled: true, cfImageModel: "@cf/black-forest-labs/flux-1-schnell",
+  cfVisionEnabled: true, cfVisionModel: "@cf/llava-hf/llava-1.5-7b-hf",
+  sttEnabled: true, sttModel: "@cf/openai/whisper-large-v3-turbo",
+  translateEnabled: true, translateModel: "@cf/meta/m2m100-1.2b",
+  embedEnabled: true, embedModel: "@cf/baai/bge-base-en-v1.5",
+  sentimentEnabled: true, sentimentModel: "@cf/huggingface/distilbert-sst-2-int8",
+  groqModelPrimary: "openai/gpt-oss-120b",
+  groqModelFallback: "llama-3.3-70b-versatile",
+  providerModels: {},
+  temperature: 0.7,
+  topP: 1,
+  visionInterpret: true,
+  embedRerank: false,
 
   generalSearchWorker: "https://withered-cake-aa88.zeemar256.workers.dev/",
   newsSearchWorker: "https://curly-band-5b64.imzeeworld.workers.dev/",
@@ -121,12 +141,12 @@ const DEFAULT_CONFIG = {
 };
 
 const PROVIDER_MODELS = {
-  groq: ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
-  cerebras: ["llama3.1-8b", "llama-3.3-70b"],
-  openrouter: ["meta-llama/llama-3.1-8b-instruct:free", "google/gemma-2-9b-it:free"],
+  groq: ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"],
+  cerebras: ["gpt-oss-120b", "llama-3.3-70b", "llama3.1-8b"],
+  openrouter: ["openai/gpt-oss-120b:free", "meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.1-8b-instruct:free", "google/gemma-2-9b-it:free"],
   mistral: ["mistral-small-latest", "open-mistral-7b"],
-  cohere: ["command-r", "command-r-plus"],
-  nvidia: ["meta/llama-3.1-8b-instruct", "meta/llama-3.1-70b-instruct"]
+  cohere: ["command-r-plus", "command-r"],
+  nvidia: ["meta/llama-3.1-70b-instruct", "meta/llama-3.1-8b-instruct"]
 };
 
 const VISION_MODELS = {
@@ -833,6 +853,23 @@ async function relevantMemories(env, cfg, uid, message) {
   try { node = await fbGet(env, `memories/${uid}`); } catch (e) { return []; }
   if (!node) return [];
   const wantsRecall = /\b(remember|remind|don't forget|do you recall|last time|you said|i told you)\b/i.test(message);
+  if (cfg.embedRerank === true && env.AI) {
+    try {
+      const items = [];
+      for (const k of Object.keys(node)) { const mm = node[k]; if (mm && mm.text) items.push(String(mm.text).slice(0, 400)); if (items.length >= 15) break; }
+      if (items.length > 2) {
+        const er = await cfAI(env, cfg.embedModel || "@cf/baai/bge-base-en-v1.5", { text: [String(message).slice(0, 400)].concat(items) });
+        const vecs = er.ok && er.out && er.out.data;
+        if (vecs && vecs.length === items.length + 1) {
+          const q = vecs[0];
+          const cos = (a, b) => { let s = 0, na = 0, nb = 0; for (let i = 0; i < a.length; i++) { s += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; } return s / (Math.sqrt(na) * Math.sqrt(nb) || 1); };
+          const ranked = items.map((t, i) => ({ t, s: cos(q, vecs[i + 1]) })).sort((x, y) => y.s - x.s);
+          const top = ranked.filter(x => x.s > 0.35).slice(0, wantsRecall ? 6 : 3).map(x => x.t);
+          if (top.length) return top;
+        }
+      }
+    } catch (e) {}
+  }
   const qw = new Set(queryWords(message));
   const scored = [];
   for (const k of Object.keys(node)) {
@@ -869,7 +906,7 @@ async function fetchWithTimeout(url, opts, ms) {
 }
 
 async function searchTavily(env, query, count) {
-  for (const key of splitKeys(env.TAVILY_KEYS)) {
+  for (const key of keysFrom((await getSecrets(env)).tavilyKeys).concat(splitKeys(env.TAVILY_KEYS))) {
     const res = await fetchWithTimeout("https://api.tavily.com/search", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ api_key: key, query, max_results: Math.min(count, 10), include_answer: false })
@@ -886,7 +923,7 @@ async function searchTavily(env, query, count) {
 }
 
 async function searchSerper(env, query, count) {
-  for (const key of splitKeys(env.SERPER_KEYS)) {
+  for (const key of keysFrom((await getSecrets(env)).serperKeys).concat(splitKeys(env.SERPER_KEYS))) {
     const res = await fetchWithTimeout("https://google.serper.dev/search", {
       method: "POST", headers: { "X-API-KEY": key, "Content-Type": "application/json" },
       body: JSON.stringify({ q: query, num: Math.min(count, 10) })
@@ -1033,7 +1070,7 @@ function canSearch(u, cfg, perms) {
 }
 
 async function callOpenAICompatible(endpoint, key, model, messages, maxTokens, opts, provider) {
-  const body = { model, messages, max_tokens: maxTokens, stream: false };
+  const body = { model, messages, max_tokens: maxTokens, stream: false, temperature: GEN_PARAMS.t, top_p: GEN_PARAMS.p };
   if (provider === "deepseek" && opts && opts.thinking) {
     body.thinking = { type: "enabled" };
     body.reasoning_effort = "high";
@@ -1048,7 +1085,7 @@ async function callOpenAICompatible(endpoint, key, model, messages, maxTokens, o
       signal: controller.signal
     });
     clearTimeout(timeout);
-    if (!res.ok) return { ok: false, status: res.status, error: "HTTP " + res.status };
+    if (!res.ok) { markKeyDead(provider, key, res.status); return { ok: false, status: res.status, error: "HTTP " + res.status }; }
     const data = await res.json();
     const msg = data.choices && data.choices[0] && data.choices[0].message;
     const finish = data.choices && data.choices[0] ? (data.choices[0].finish_reason || "") : "";
@@ -1062,20 +1099,166 @@ async function callOpenAICompatible(endpoint, key, model, messages, maxTokens, o
   }
 }
 
+function modelsForProvider(cfg, provider) {
+  const pm = cfg.providerModels && cfg.providerModels[provider];
+  if (Array.isArray(pm) && pm.length) return pm.map(m => String(m).trim()).filter(Boolean);
+  if (provider === "groq" && (cfg.groqModelPrimary || cfg.groqModelFallback)) {
+    const legacy = [cfg.groqModelPrimary, cfg.groqModelFallback].filter(Boolean);
+    const rest = (PROVIDER_MODELS.groq || []).filter(m => legacy.indexOf(m) === -1);
+    return legacy.concat(rest);
+  }
+  return PROVIDER_MODELS[provider] || [];
+}
+
+let GEN_PARAMS = { t: 0.7, p: 1 };
+const DEAD_KEYS = {};
+function keyDead(provider, key) {
+  const id = provider + "|" + String(key).slice(0, 14);
+  return DEAD_KEYS[id] && DEAD_KEYS[id] > nowMs();
+}
+function markKeyDead(provider, key, status) {
+  const id = provider + "|" + String(key).slice(0, 14);
+  if (status === 401 || status === 403) DEAD_KEYS[id] = nowMs() + 6 * 60 * 60 * 1000;
+  else if (status === 429 || status === 402) DEAD_KEYS[id] = nowMs() + 65 * 1000;
+  else DEAD_KEYS[id] = nowMs() + 20 * 1000;
+}
+
+function removeActionTreeObjects(t) {
+  let guard = 0;
+  while (guard < 4) {
+    const k = t.indexOf('"action_tree"');
+    if (k === -1) break;
+    let start = t.lastIndexOf("{", k);
+    if (start === -1) { t = t.replace('"action_tree"', " "); guard++; continue; }
+    let depth = 0, end = -1;
+    for (let i = start; i < t.length; i++) {
+      if (t[i] === "{") depth++;
+      else if (t[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) { t = t.slice(0, start); break; }
+    t = t.slice(0, start) + " " + t.slice(end + 1);
+    guard++;
+  }
+  return t;
+}
+
+function stripStepJunk(text) {
+  let t = String(text || "");
+  if (!t) return "";
+  t = t.replace(/```(?:json)?[^`]*"action_tree"[\s\S]*?```/gi, " ");
+  t = removeActionTreeObjects(t);
+  t = t.replace(/\[\s*[FVE-]\s*[^\]]{0,20}steps?[^\]]{0,10}\]/gi, " ");
+  t = t.replace(/^\s*(Editing file|Thought process\s*>|Architecting\s*>|Orchestrating\s*>|Examining\s*>|current_step_title|overall_action).*$/gim, " ");
+  t = t.replace(/[ \t]{3,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return t;
+}
+
+async function cfAI(env, model, inputs) {
+  if (!env.AI) return { ok: false, error: "binding-missing" };
+  try {
+    const out = await env.AI.run(model, inputs);
+    return { ok: true, out };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e).slice(0, 200) };
+  }
+}
+
+async function callCartesia(env, cfg, text, voiceId) {
+  const sec = await getSecrets(env);
+  let keys = keysFrom(sec.cartesiaKeys);
+  if (!keys.length) keys = Array.isArray(cfg.cartesiaKeys) ? cfg.cartesiaKeys.filter(Boolean) : [];
+  if (!keys.length) return { ok: false, error: "no-keys" };
+  let meta = null;
+  try { meta = await fbGet(env, "ttsMeta"); } catch (e) {}
+  meta = meta || {};
+  meta.dead = meta.dead || {};
+  const start = Number(meta.next) || 0;
+  const n = keys.length;
+  for (let step = 0; step < n; step++) {
+    const i = (start + step) % n;
+    if (meta.dead[i] && Number(meta.dead[i]) > nowMs()) continue;
+    try {
+      const res = await fetch("https://api.cartesia.ai/tts/bytes", {
+        method: "POST",
+        headers: {
+          "Cartesia-Version": cfg.cartesiaVersion || "2025-04-16",
+          "X-API-Key": keys[i],
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model_id: cfg.cartesiaModel || "sonic-2",
+          transcript: text,
+          voice: { mode: "id", id: voiceId || cfg.cartesiaVoice || "694f9389-aac1-45b6-b726-9d9369183238" },
+          output_format: { container: "mp3", sample_rate: 44100, bit_rate: 128000 }
+        })
+      });
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        if (buf && buf.byteLength > 200) {
+          meta.next = (i + 1) % n;
+          if (meta.dead[i] !== undefined) delete meta.dead[i];
+          try { await fbSet(env, "ttsMeta", meta); } catch (e) {}
+          return { ok: true, buf };
+        }
+      }
+      if (res.status === 401 || res.status === 403) meta.dead[i] = nowMs() + hoursToMs(24);
+      else if (res.status === 402 || res.status === 429) meta.dead[i] = nowMs() + hoursToMs(1);
+      else meta.dead[i] = nowMs() + 10 * 60 * 1000;
+    } catch (e) {
+      meta.dead[i] = nowMs() + 10 * 60 * 1000;
+    }
+  }
+  try { await fbSet(env, "ttsMeta", meta); } catch (e) {}
+  return { ok: false, error: "all-keys-busy" };
+}
+
+async function geminiKey(env) {
+  const sec = await getSecrets(env);
+  const arr = keysFrom(sec.geminiKeys);
+  if (arr.length) return arr[0];
+  return env.GEMINI_KEY || "";
+}
+
+let SECRETS_CACHE = { at: 0, data: null };
+async function getSecrets(env) {
+  if (SECRETS_CACHE.data && (nowMs() - SECRETS_CACHE.at) < 60000) return SECRETS_CACHE.data;
+  let node = null;
+  try { node = await fbGet(env, "secrets"); } catch (e) {}
+  SECRETS_CACHE = { at: nowMs(), data: node || {} };
+  return SECRETS_CACHE.data;
+}
+function keysFrom(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.map(k => String(k).trim()).filter(Boolean);
+  return String(val).split(/[\n,]+/).map(k => k.trim()).filter(Boolean);
+}
+async function poolKeys(env, provider) {
+  const sec = await getSecrets(env);
+  const fromPanel = keysFrom(sec[provider + "Keys"]);
+  if (fromPanel.length) return fromPanel;
+  return splitKeys(env[provider.toUpperCase() + "_KEYS"]);
+}
+async function singleKey(env, name, envNames) {
+  const sec = await getSecrets(env);
+  if (sec[name]) return String(sec[name]).trim();
+  for (const n of envNames) { if (env[n]) return env[n]; }
+  return "";
+}
+
 async function callStandard(env, cfg, messages, maxTokens) {
   const order = cfg.providerOrder || DEFAULT_CONFIG.providerOrder;
   let lastErr = "no providers available";
   for (const provider of order) {
-    const keys = splitKeys(env[provider.toUpperCase() + "_KEYS"]);
-    const models = PROVIDER_MODELS[provider] || [];
+    const keys = await poolKeys(env, provider);
+    const models = modelsForProvider(cfg, provider);
     if (!keys.length || !models.length) continue;
     const endpoint = PROVIDER_ENDPOINTS[provider];
-    for (const key of keys) {
-      for (const model of models) {
+    for (const model of models) {
+      for (const key of keys) {
+        if (keyDead(provider, key)) continue;
         const result = await callOpenAICompatible(endpoint, key, model, messages, maxTokens, null, provider);
         if (result.ok) return { ok: true, text: result.text, provider, model, finish: result.finish };
         lastErr = result.error || "error";
-        if ([401, 402, 403, 429].includes(result.status)) break;
       }
     }
   }
@@ -1103,12 +1286,13 @@ async function autoContinue(env, cfg, callFn, messages, first, maxTokens, u, mul
 }
 
 async function callDeepseek(env, cfg, messages, maxTokens, thinking, keyName, model) {
-  const key = env[keyName] || env.DEEPSEEK_KEY_1 || env.DEEPSEEK_KEY_2;
+  const sec = await getSecrets(env);
+  const key = (keyName === "DEEPSEEK_KEY_2" ? (sec.deepseekKey2 || env.DEEPSEEK_KEY_2) : (sec.deepseekKey1 || env.DEEPSEEK_KEY_1)) || sec.deepseekKey1 || env[keyName] || env.DEEPSEEK_KEY_1 || sec.deepseekKey2 || env.DEEPSEEK_KEY_2;
   if (!key) return await callStandard(env, cfg, messages, maxTokens);
   const useModel = model || cfg.titanModel || "deepseek-v4-flash";
   const r = await callOpenAICompatible(PROVIDER_ENDPOINTS.deepseek, key, useModel, messages, maxTokens, { thinking }, "deepseek");
   if (r.ok) return { ok: true, text: r.text, provider: "deepseek", model: useModel, reasoning: r.reasoning, finish: r.finish };
-  const alt = keyName === "DEEPSEEK_KEY_1" ? env.DEEPSEEK_KEY_2 : env.DEEPSEEK_KEY_1;
+  const alt = keyName === "DEEPSEEK_KEY_1" ? (sec.deepseekKey2 || env.DEEPSEEK_KEY_2) : (sec.deepseekKey1 || env.DEEPSEEK_KEY_1);
   if (alt && alt !== key) {
     const r2 = await callOpenAICompatible(PROVIDER_ENDPOINTS.deepseek, alt, useModel, messages, maxTokens, { thinking }, "deepseek");
     if (r2.ok) return { ok: true, text: r2.text, provider: "deepseek", model: useModel, reasoning: r2.reasoning, finish: r2.finish };
@@ -1117,7 +1301,7 @@ async function callDeepseek(env, cfg, messages, maxTokens, thinking, keyName, mo
 }
 
 async function geminiGenerate(env, cfg, model, body) {
-  const key = env.GEMINI_KEY;
+  const key = (await geminiKey(env));
   if (!key) return null;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
   return await fetchWithTimeout(url, {
@@ -1126,7 +1310,7 @@ async function geminiGenerate(env, cfg, model, body) {
 }
 
 async function callGemini(env, cfg, messages, maxTokens, opts) {
-  if (!env.GEMINI_KEY) return await callStandard(env, cfg, messages, maxTokens);
+  if (!(await geminiKey(env))) return await callStandard(env, cfg, messages, maxTokens);
   const model = cfg.geminiModel || "gemini-3.5-flash";
   const sys = messages.find(m => m.role === "system");
   const contents = messages.filter(m => m.role !== "system").map(m => ({
@@ -1171,7 +1355,7 @@ async function callGemini(env, cfg, messages, maxTokens, opts) {
 }
 
 async function callGeminiVision(env, cfg, text, images, maxTokens) {
-  if (!env.GEMINI_KEY) return { ok: false, error: "Gemini key missing" };
+  if (!(await geminiKey(env))) return { ok: false, error: "Gemini key missing" };
   const model = cfg.geminiVisionModel || "gemini-3.5-flash";
   const parts = [{ text: text || "Describe this in detail." }];
   for (const im of images) parts.push({ inline_data: { mime_type: im.mime || "image/jpeg", data: im.data } });
@@ -1189,7 +1373,7 @@ async function callGeminiVision(env, cfg, text, images, maxTokens) {
 }
 
 async function callGeminiImage(env, cfg, prompt) {
-  if (!env.GEMINI_KEY) return { ok: false, error: "Gemini key missing" };
+  if (!(await geminiKey(env))) return { ok: false, error: "Gemini key missing" };
   const model = cfg.geminiImageModel || "gemini-3.1-flash-image";
   let body = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } };
   let res = await geminiGenerate(env, cfg, model, body);
@@ -1223,7 +1407,7 @@ async function callVisionStandard(env, cfg, text, images, maxTokens) {
   const order = (cfg.visionProviderOrder && cfg.visionProviderOrder.length)
     ? cfg.visionProviderOrder : VISION_PROVIDER_ORDER;
   for (const provider of order) {
-    const keys = splitKeys(env[provider.toUpperCase() + "_KEYS"]);
+    const keys = await poolKeys(env, provider);
     const models = VISION_MODELS[provider] || [];
     if (!keys.length || !models.length) continue;
     const endpoint = PROVIDER_ENDPOINTS[provider];
@@ -1642,7 +1826,7 @@ async function jobStart(env, cfg, uid, u, body) {
     if (!plan.some(p => p.indexOf("#test") === 0)) plan.push("#test Test all files and fix errors");
     if (!plan.some(p => p.indexOf("#present") === 0)) plan.push("#present Finalize and deliver all files");
     discussion.push({ speaker: isPaid ? "Strategic" : "Zama", text: "Plan ready: " + plan.length + " steps. I broke the job into small safe pieces." });
-    if (isPaid && cfg.teamModeEnabled && env.GEMINI_KEY) {
+    if (isPaid && cfg.teamModeEnabled && (await geminiKey(env))) {
       const brain = await callGemini(env, cfg, [
         { role: "system", content: "You are Nexus, the ideas member of the Zama AI team. Be brief and sharp." },
         { role: "user", content: "The team is about to start this job:\n" + task.slice(0, 1500) + "\n\nPlan:\n" + plan.slice(0, 20).join("\n") + "\n\nIn under 120 words: your best ideas and the biggest risks to watch." }
@@ -1806,7 +1990,7 @@ async function jobStep(env, cfg, uid, u, body) {
           { role: "system", content: sysP + skillPart + "\n\nYou verify Zama's work like a console error checker: syntax errors, broken logic, missing pieces, unclosed tags.\n\n" + WORK_FORMAT_RULES },
           { role: "user", content: "STEP JUST DONE: " + stepDesc + "\n\nCURRENT FILES:" + checkCtx + "\n\nHunt for errors this step could have introduced. Fix them NOW with surgical @@EDIT blocks only. If everything is correct, reply exactly: ALL CHECKS PASSED" }
         ];
-        const checkRes = team && env.GEMINI_KEY
+        const checkRes = team && (await geminiKey(env))
           ? await callGemini(env, cfg, checkMsgs, Math.min(1200, providerMaxTokens(perms, afford2)), { search: false })
           : await worker(checkMsgs, Math.min(1200, providerMaxTokens(perms, afford2)));
         if (checkRes.ok) {
@@ -2028,7 +2212,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
         }
       }
     }
-    let v = (isPaid && env.GEMINI_KEY)
+    let v = (isPaid && (await geminiKey(env)))
       ? await callGeminiVision(env, cfg, (skillText ? skillText + "\n\n" : "") + message, images, maxTok)
       : await callVisionStandard(env, cfg, (skillText ? skillText + "\n\n" : "") + message, images, maxTok);
     if (!v.ok) v = await callVisionStandard(env, cfg, message, images, maxTok);
@@ -2127,6 +2311,17 @@ async function handleChat(env, cfg, uid, u, body, email) {
   if (looksJunk(result.text)) {
     const retry = await callStandard(env, cfg, messages, maxTok);
     if (retry.ok && !looksJunk(retry.text)) result = retry;
+  }
+
+  const stripped = stripStepJunk(result.text);
+  if (stripped && stripped.length >= 2) {
+    result = Object.assign({}, result, { text: stripped });
+  } else {
+    const plainMsgs = [{ role: "system", content: "Reply with a plain, complete, natural answer in normal sentences. Do NOT output JSON, action trees, step lists, or planning of any kind - only the actual answer to the user." }].concat(messages.filter(m => m.role !== "system"));
+    const retry2 = await callStandard(env, cfg, plainMsgs, maxTok);
+    if (retry2.ok && stripStepJunk(retry2.text).length >= 2) {
+      result = Object.assign({}, retry2, { text: stripStepJunk(retry2.text) });
+    }
   }
 
   if (result.sources && result.sources.length) sources = sources.concat(result.sources);
@@ -2300,7 +2495,17 @@ async function handleVision(env, cfg, uid, u, body) {
     if (!isUnlimited(limit) && seconds > limit && !isAdmin) {
       return json({ error: (kind === "camera" ? "Live camera" : "Video") + " is limited to " + limit + " seconds on your plan." }, 403);
     }
-    frames = frames.slice(0, cfg.maxVideoFrames || 8);
+    if (kind === "video" && !isPaid && !isAdmin) {
+      const dayKey = new Date().toISOString().slice(0, 10);
+      if (u.videoDay !== dayKey) { u.videoDay = dayKey; u.videosToday = 0; }
+      const perDay = cfg.videoFreePerDay === undefined ? 1 : cfg.videoFreePerDay;
+      if (!isUnlimited(perDay) && (u.videosToday || 0) >= perDay) {
+        return json(friendly("Free plan includes " + perDay + " video a day. Your next video unlocks tomorrow, or upgrade for more."), 403);
+      }
+      u.videosToday = (u.videosToday || 0) + 1;
+      await saveUser(env, uid, u);
+    }
+    frames = frames.slice(0, cfg.maxVideoFrames || 50);
   } else {
     frames = frames.slice(0, cfg.maxImagesPerMessage || 4);
   }
@@ -2310,17 +2515,40 @@ async function handleVision(env, cfg, uid, u, body) {
     : kind === "video"
       ? "These are frames from a short video in time order. Describe what happens across the video. Question: " + String(body.message || "What happens in this video?")
       : String(body.message || "Describe this image in detail.");
+  if (body.transcript && String(body.transcript).trim()) {
+    prompt += "\n\nThe audio spoken in this " + (kind === "camera" ? "camera feed" : "video") + " was transcribed as:\n\"" + String(body.transcript).trim().slice(0, 4000) + "\"\nUse BOTH what you see in the frames and what you hear in this transcript.";
+  }
 
   const flags = deriveFlags(body.message, { images: frames, kind });
   const skills = await getSkillsFor(env, cfg, perms, String(body.message || kind), flags);
   const skillText = skills.length ? skillsBlock(skills) + "\n\n" : "";
 
   const maxTok = providerMaxTokens(perms, afford);
-  let v = (isPaid && env.GEMINI_KEY)
+  let v = (isPaid && (await geminiKey(env)))
     ? await callGeminiVision(env, cfg, skillText + prompt, frames, maxTok)
     : await callVisionStandard(env, cfg, skillText + prompt, frames, maxTok);
   if (!v.ok) v = await callVisionStandard(env, cfg, prompt, frames, maxTok);
+  if (!v.ok && cfg.cfVisionEnabled !== false && env.AI && frames.length) {
+    try {
+      const b64 = String(frames[0]).split(",").pop();
+      const bin = atob(b64);
+      const arr = new Array(bin.length);
+      for (let bi = 0; bi < bin.length; bi++) arr[bi] = bin.charCodeAt(bi);
+      const cv = await cfAI(env, cfg.cfVisionModel || "@cf/llava-hf/llava-1.5-7b-hf", { image: arr, prompt: prompt.slice(0, 600), max_tokens: 512 });
+      const cvText = cv.ok ? ((cv.out && (cv.out.description || cv.out.response || cv.out.text)) || "") : "";
+      if (cvText) v = { ok: true, text: cvText, provider: "cloudflare", model: cfg.cfVisionModel || "llava" };
+    } catch (e) {}
+  }
   if (!v.ok) return json({ error: "All vision providers busy. Try again shortly." }, 502);
+  if (cfg.visionInterpret !== false && v.text) {
+    const interp = await callStandard(env, cfg, [
+      { role: "system", content: "You are Zama. A vision model watched the user's " + (kind === "image" ? "image(s)" : kind) + " and reported what it saw. Give the user the final, clear, helpful answer to their question using that report. Speak naturally as if YOU saw it. Never mention the report or the vision model." },
+      { role: "user", content: "The user asked: " + String(body.message || "Describe what you see.").slice(0, 600) + "\n\nWhat was seen:\n" + v.text.slice(0, 6000) + (body.transcript ? "\n\nWhat was heard (audio transcript):\n" + String(body.transcript).slice(0, 3000) : "") }
+    ], maxTok);
+    if (interp.ok && stripStepJunk(interp.text).length > 10) {
+      v = { ok: true, text: stripStepJunk(interp.text), provider: interp.provider, model: interp.model };
+    }
+  }
   const b = await enforceBudget(env, cfg, uid, u, v.text, 1, null);
   await saveUser(env, uid, u);
   return json({ ok: true, text: b.text, cut: b.cut, message: b.cut ? b.cutMessage : null, provider: v.provider, model: v.model, kind, skillsRead: skills.map(s => s.name), warning: buildWarning(u, cfg, isAdmin) });
@@ -2657,10 +2885,14 @@ export default {
 
         case "/image": {
           if (!cfg.imageGenEnabled) return json({ error: "Image generation is disabled." }, 403);
-          if (u.plan !== "paid" && uid !== ADMIN_UID) return json({ error: cfg.upgradeMessage }, 403);
           const prompt = String(body.prompt || "").trim();
           if (!prompt) return json({ error: "prompt required" }, 400);
-          const r = await callGeminiImage(env, cfg, prompt);
+          let r = { ok: false };
+          if (cfg.cfImageEnabled !== false) {
+            const cf = await cfAI(env, cfg.cfImageModel || "@cf/black-forest-labs/flux-1-schnell", { prompt: prompt.slice(0, 1800) });
+            if (cf.ok && cf.out && cf.out.image) r = { ok: true, image: cf.out.image, mime: "image/jpeg", text: "" };
+          }
+          if (!r.ok) r = await callGeminiImage(env, cfg, prompt);
           if (!r.ok) return json(friendly("Image creation is resting right now. Please try again shortly."), 502);
           deductTokens(u, cfg, unitCost(cfg, 2));
           await saveUser(env, uid, u);
@@ -2870,6 +3102,73 @@ export default {
         case "/notif/seen": {
           await fbSet(env, `notifMeta/${uid}`, { lastSeen: nowMs() });
           return json({ ok: true });
+        }
+
+        case "/tts": {
+          if (cfg.cartesiaEnabled === false) return json(friendly("Zama's voice is switched off right now."), 403);
+          let ttsText = String(body.text || "").trim();
+          if (!ttsText) return json(friendly("Nothing to speak."), 400);
+          ttsText = ttsText.slice(0, cfg.ttsMaxChars || 500);
+          const ttsDayKey = new Date().toISOString().slice(0, 10);
+          if (u.ttsDay !== ttsDayKey) { u.ttsDay = ttsDayKey; u.ttsToday = 0; }
+          const ttsCap = u.plan === "paid" ? (cfg.ttsDailyPaid === undefined ? 300 : cfg.ttsDailyPaid) : (cfg.ttsDailyFree === undefined ? 15 : cfg.ttsDailyFree);
+          if (uid !== ADMIN_UID && !isUnlimited(ttsCap) && (u.ttsToday || 0) >= ttsCap) {
+            return json(friendly("You have used all your Zama voice for today. It resets tomorrow" + (u.plan === "paid" ? "." : ", or upgrade for much more voice.")), 403);
+          }
+          const tr = await callCartesia(env, cfg, ttsText, body.voice);
+          if (!tr.ok) return json(friendly("Zama's voice is resting right now. Please try again shortly."), 502);
+          u.ttsToday = (u.ttsToday || 0) + 1;
+          await saveUser(env, uid, u);
+          return new Response(tr.buf, {
+            headers: {
+              "Content-Type": "audio/mpeg",
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Headers": "Content-Type, Authorization",
+              "Access-Control-Allow-Methods": "POST, GET, OPTIONS"
+            }
+          });
+        }
+
+        case "/stt": {
+          if (cfg.sttEnabled === false) return json(friendly("Listening is switched off right now."), 403);
+          const audio = String(body.audio || "");
+          if (!audio || audio.length < 100) return json(friendly("No audio received."), 400);
+          const sr = await cfAI(env, cfg.sttModel || "@cf/openai/whisper-large-v3-turbo", { audio: audio.split(",").pop() });
+          if (!sr.ok) return json(friendly("Zama couldn't hear that clearly. Please try again."), 502);
+          const heard = (sr.out && (sr.out.text || (sr.out.result && sr.out.result.text))) || "";
+          return json({ ok: true, text: String(heard).trim() });
+        }
+
+        case "/translate": {
+          if (cfg.translateEnabled === false) return json(friendly("Translation is switched off right now."), 403);
+          const tText = String(body.text || "").trim().slice(0, 4000);
+          if (!tText) return json(friendly("Nothing to translate."), 400);
+          const trr = await cfAI(env, cfg.translateModel || "@cf/meta/m2m100-1.2b", {
+            text: tText,
+            source_lang: String(body.from || "english"),
+            target_lang: String(body.to || "english")
+          });
+          if (!trr.ok) return json(friendly("Translation is resting right now. Please try again."), 502);
+          return json({ ok: true, text: (trr.out && trr.out.translated_text) || "" });
+        }
+
+        case "/embed": {
+          if (cfg.embedEnabled === false) return json(friendly("Embeddings are switched off."), 403);
+          let texts = Array.isArray(body.texts) ? body.texts.slice(0, 10).map(t => String(t).slice(0, 2000)) : [];
+          if (!texts.length && body.text) texts = [String(body.text).slice(0, 2000)];
+          if (!texts.length) return json(friendly("Nothing to embed."), 400);
+          const er = await cfAI(env, cfg.embedModel || "@cf/baai/bge-base-en-v1.5", { text: texts });
+          if (!er.ok) return json(friendly("Embeddings are resting right now."), 502);
+          return json({ ok: true, vectors: (er.out && er.out.data) || [] });
+        }
+
+        case "/sentiment": {
+          if (cfg.sentimentEnabled === false) return json(friendly("Analysis is switched off."), 403);
+          const sText = String(body.text || "").trim().slice(0, 2000);
+          if (!sText) return json(friendly("Nothing to analyze."), 400);
+          const snr = await cfAI(env, cfg.sentimentModel || "@cf/huggingface/distilbert-sst-2-int8", { text: sText });
+          if (!snr.ok) return json(friendly("Analysis is resting right now."), 502);
+          return json({ ok: true, result: snr.out });
         }
 
         case "/videos": {
