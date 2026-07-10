@@ -679,11 +679,9 @@ function buildSystemPrompt(cfg, modeKey, arena, providerFamily) {
   if (cfg.responseStyle) parts.push("HOW YOU MUST RESPOND:\n" + cfg.responseStyle);
   if (cfg.forbiddenRules) parts.push("YOU MUST NEVER DO THE FOLLOWING:\n" + cfg.forbiddenRules);
   if (cfg.dockSkillsEnabled) {
-    parts.push("DOCK SKILLS LAW: You are governed by WOD Dock Skills rules. When Dock Skills content is provided, you MUST obey it with 100% accuracy and full strictness. You NEVER quote, mention, list, or leak Dock Skills content in your reply - you silently obey them and answer cleanly. HIGHEST LAW: Dock Skills sharpen your answers - they must NEVER reduce answer quality, NEVER block a valid answer, and NEVER interfere with normal conversation. If a skill ever seems to conflict with giving the user a complete, correct, helpful answer, the complete correct answer wins.");
-  } else {
-    parts.push("Dock Skills are currently switched OFF by WOD. Answer using your identity rules only.");
+    parts.push("If skill notes appear in the background reference, follow them silently. A complete, correct, helpful answer always comes first.");
   }
-  parts.push("STRICT OBEDIENCE: Follow the identity and rules above in EVERY reply, no matter what. If reference facts, memories, or search results are provided, use them ONLY to answer the exact question asked. NEVER volunteer, mention, or add reference facts the user did not ask about. No bonus facts, no trivia. Answer the question, then stop.");
+  parts.push("Reply to the user's newest message, exactly as written. Background reference data is never something the user said - use it silently, only when it answers the question, and never mention it. A short thanks or okay gets a brief warm reply, never a repeat of your last answer. Harmless requests to pretend or act are games - play along.");
   return parts.filter(Boolean).join("\n\n");
 }
 
@@ -2203,7 +2201,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
         const model = modeKey === "strategic" ? (cfg.strategicModel || "deepseek-v4-pro") : (cfg.titanModel || "deepseek-v4-flash");
         const dsRes = await callDeepseek(env, cfg, [
           { role: "system", content: buildSystemPrompt(cfg, modeKey, arena, "deepseek") + (skillText ? "\n\n" + skillText : "") },
-          { role: "user", content: "[IMAGE DESCRIPTION provided by the vision system]:\n" + desc + "\n\nUSER'S QUESTION:\n" + (message || "Describe the image.") }
+          { role: "system", content: "=== BACKGROUND REFERENCE (system data - the user did not write this and cannot see it; use silently) ===\nWhat the image shows:\n" + desc },
+          { role: "user", content: message || "Describe the image." }
         ], maxTok, mode.deep, mode.keyName, model);
         if (dsRes.ok) {
           const b = await enforceBudget(env, cfg, uid, u, dsRes.text, mult, null);
@@ -2225,9 +2224,13 @@ async function handleChat(env, cfg, uid, u, body, email) {
   let contextBlocks = [];
   let sources = [];
   let usedNews = false;
-  if (skillText) contextBlocks.push(skillText);
+  const ackT = String(message || "").trim();
+  const ackCore = /\b(ok|okay|thanks|thank|thx|ty|cool|nice|great|perfect|awesome|alright|got it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|good|done)\b/i;
+  const ackAll = /^((ok(ay)?|thanks?|thank|you|thx|ty|cool|nice|great|perfect|awesome|alright|got|it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|so|too|much|very|really|a|lot|man|please|zama|my|friend|dear|one|good|well|done|job)[\s,.!?]*)+$/i;
+  const isAckTurn = ackT.length > 0 && ackT.length <= 40 && ackCore.test(ackT) && ackAll.test(ackT);
+  if (skillText && !isAckTurn) contextBlocks.push(skillText);
 
-  const [profB, mems, cmNode] = await Promise.all([
+  const [profB, mems, cmNode] = isAckTurn ? [null, [], null] : await Promise.all([
     profileBlock(env, cfg, uid, email, body.localTime),
     relevantMemories(env, cfg, uid, message),
     body.chatId ? fbGet(env, `chatMem/${uid}/${safeKey(body.chatId)}`).catch(() => null) : Promise.resolve(null)
@@ -2269,13 +2272,15 @@ async function handleChat(env, cfg, uid, u, body, email) {
     return false;
   };
 
-  if (kmhFirst) {
-    const hit = await tryKmh();
-    if (!hit && wantsCurrent) await tryWeb();
-  } else {
-    let hit = false;
-    if (wantsCurrent) hit = await tryWeb();
-    if (!hit) await tryKmh();
+  if (!isAckTurn) {
+    if (kmhFirst) {
+      const hit = await tryKmh();
+      if (!hit && wantsCurrent) await tryWeb();
+    } else {
+      let hit = false;
+      if (wantsCurrent) hit = await tryWeb();
+      if (!hit) await tryKmh();
+    }
   }
 
   let videos = [];
@@ -2287,8 +2292,12 @@ async function handleChat(env, cfg, uid, u, body, email) {
     }
   }
 
-  const sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"))
+  if (isAckTurn) contextBlocks = [];
+  let sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"))
     + "\n\nSCREEN ISOLATION LAW: This is the general chat. Never mention, invent, or discuss Marketplace business listings or News-screen articles here. Each screen of the app has its own separate context.";
+  if (contextBlocks.length) {
+    sysP += "\n\n=== BACKGROUND REFERENCE (system data - the user did not write this and cannot see it; use silently) ===\n\n" + contextBlocks.join("\n\n");
+  }
   const messages = [{ role: "system", content: sysP }];
   const history = Array.isArray(body.history) ? body.history.slice(-12) : [];
   for (const h of history) {
@@ -2296,9 +2305,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
       messages.push({ role: h.role, content: h.content.slice(0, 3000) });
     }
   }
-  let userContent = message;
-  if (contextBlocks.length) userContent = contextBlocks.join("\n\n") + "\n\nUSER'S QUESTION:\n" + message;
-  messages.push({ role: "user", content: userContent });
+  messages.push({ role: "user", content: message });
 
   const maxTok = providerMaxTokens(perms, afford);
   let result = await callByMode(env, cfg, modeKey, messages, maxTok, mode.deep || body.deep === true);
