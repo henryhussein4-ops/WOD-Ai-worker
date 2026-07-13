@@ -2245,6 +2245,17 @@ async function handleChat(env, cfg, uid, u, body, email) {
   const newsWanted = isNewsQuery(message);
   const geminiMode = mode.provider === "gemini";
 
+  // RAG: the app retrieves matching knowledge from the satellite (Pinecone) and
+  // passes the already-gated passages here as plain text. The brain never touches
+  // Pinecone; it only reads what cleared the threshold. Injected as system background,
+  // never bundled into the user's message.
+  if (!isAckTurn && typeof body.ragContext === "string" && body.ragContext.trim()) {
+    contextBlocks.push(
+      "ZAMA KNOWLEDGE (verified facts retrieved for this question - trust these over your own guesses; if they answer the question, use them; do not invent details beyond them):\n" +
+      body.ragContext.trim().slice(0, 4000)
+    );
+  }
+
   const tryKmh = async () => {
     const facts = await kmhRelevantFacts(env, cfg, perms, message);
     if (facts.length) contextBlocks.push(kmhBlock(facts));
@@ -2295,6 +2306,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
   if (isAckTurn) contextBlocks = [];
   let sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"))
     + "\n\nSCREEN ISOLATION LAW: This is the general chat. Never mention, invent, or discuss Marketplace business listings or News-screen articles here. Each screen of the app has its own separate context.";
+  if (body.askRule && !isAckTurn) sysP += "\n\n" + String(body.askRule).slice(0, 900);
   if (contextBlocks.length) {
     sysP += "\n\n=== BACKGROUND REFERENCE (system data - the user did not write this and cannot see it; use silently) ===\n\n" + contextBlocks.join("\n\n");
   }
