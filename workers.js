@@ -75,11 +75,52 @@ const DEFAULT_CONFIG = {
   redirectMessage: "That request is too huge for the free models. Choose a paid mode built for it:",
 
   arenaPrompts: {
-    students: "", medical: "", bigtalks: "", teachers: "",
+    students: "You are Teacher Zamah in the Students Arena, by World Of Discoveries. Zama must: teach step by step with warmth and radical honesty; always tell the student their real mistakes kindly and exactly how to fix them, never just agree; say whether a mistake was careless or a misunderstanding, and coach the habit behind it; continue from where the last session stopped using the background reference, never guess progress; in quiz mode always write questions as 'Q.' and wait for the student's 'A.', then grade honestly with a short reason; when a request is truly ambiguous ask one short 'Q. Did you mean: A or B?' first - never for simple questions; for hard calculations solve slowly, show every step, verify every sign and unit, and check the final answer before presenting it; after solving, offer the student to explain it back to prove understanding.",
+    medical: "", bigtalks: "",
+    teachers: "You are Mentor Zamah in the Teachers Arena, by World Of Discoveries. Zama must: NEVER teach a teacher how to teach - teachers already know how to teach; work instead as a fast professional co-pilot on top of their work: lesson plans with the exact things to say, worksheets, marking help, common-mistake summaries, summaries of uploaded material, parent reports, simplified explanations for students, and assessments; keep every output ready to use in class; be honest about anything uncertain, missing, or not fully processed.",
     professional: "", research: "", files: "", developers: ""
   },
 
   searchFirst: "kmh",
+
+  nearbyProvider: "geoapify",
+  nearbyRadiusKm: 10,
+  nearbyMaxResults: 12,
+  currencyEnabled: true,
+  currencyCacheMinutes: 60,
+  newsFeedDailyLimit: 10,
+  pollinationsEnabled: true,
+  imagePromptEnhance: true,
+  mem0Enabled: true,
+  customArenasEnabled: true,
+  customArenaMax: 20,
+  arenaRouting: true,
+  arenaLimitMessage: "This Arena has reached its usage limit for today. It resets tomorrow.",
+  arenaProviders: {
+    students: { provider: "gemini", model: "gemini-3.5-flash" },
+    teachers: { provider: "gemini", model: "gemini-3.5-flash" },
+    bigtalks: { provider: "gemini", model: "gemini-3.5-flash" },
+    medical: { provider: "groq", model: "openai/gpt-oss-120b" },
+    files: { provider: "groq", model: "openai/gpt-oss-120b" },
+    developers: { provider: "groq", model: "openai/gpt-oss-120b" },
+    professional: { provider: "cerebras", model: "gpt-oss-120b" },
+    custom: { provider: "siliconflow", model: "Qwen/Qwen2.5-7B-Instruct" }
+  },
+  arenaLimits: {},
+  arenaMemoryProvider: { students: "mem0", professional: "mem0", bigtalks: "mem0" },
+
+  learningArenas: ["students", "teachers"],
+  autoDeepThink: true,
+  mistakeBankEnabled: true,
+  mistakeBankMax: 120,
+  requireLearningConsent: true,
+  arenaDocsEnabled: true,
+  arenaDocsMax: 10,
+  arenaDocMaxChars: 120000,
+  arenaDocChunk: 1200,
+  arenaDocTopChunks: 6,
+  revisionEnabled: true,
+
   researchSourcesFree: 10,
   researchSourcesPaid: 90,
   videosEnabled: true,
@@ -146,7 +187,8 @@ const PROVIDER_MODELS = {
   openrouter: ["openai/gpt-oss-120b:free", "meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.1-8b-instruct:free", "google/gemma-2-9b-it:free"],
   mistral: ["mistral-small-latest", "open-mistral-7b"],
   cohere: ["command-r-plus", "command-r"],
-  nvidia: ["meta/llama-3.1-70b-instruct", "meta/llama-3.1-8b-instruct"]
+  nvidia: ["meta/llama-3.1-70b-instruct", "meta/llama-3.1-8b-instruct"],
+  siliconflow: ["Qwen/Qwen2.5-7B-Instruct", "THUDM/glm-4-9b-chat", "internlm/internlm2_5-7b-chat"]
 };
 
 const VISION_MODELS = {
@@ -167,7 +209,9 @@ const PROVIDER_ENDPOINTS = {
   mistral: "https://api.mistral.ai/v1/chat/completions",
   nvidia: "https://integrate.api.nvidia.com/v1/chat/completions",
   cohere: "https://api.cohere.ai/compatibility/v1/chat/completions",
-  deepseek: "https://api.deepseek.com/chat/completions"
+  deepseek: "https://api.deepseek.com/chat/completions",
+  siliconflow: "https://api.siliconflow.com/v1/chat/completions",
+  gemini: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 };
 
 function json(data, status = 200) {
@@ -446,7 +490,13 @@ async function loadConfig(env) {
   const merged = Object.assign({}, DEFAULT_CONFIG, cfg || {});
   merged.freePerms = Object.assign({}, DEFAULT_CONFIG.freePerms, (cfg && cfg.freePerms) || {});
   merged.paidPerms = Object.assign({}, DEFAULT_CONFIG.paidPerms, (cfg && cfg.paidPerms) || {});
-  merged.arenaPrompts = Object.assign({}, DEFAULT_CONFIG.arenaPrompts, (cfg && cfg.arenaPrompts) || {});
+  const apIn = (cfg && cfg.arenaPrompts) || {};
+  const apClean = {};
+  for (const k of Object.keys(apIn)) { if (String(apIn[k] || "").trim()) apClean[k] = apIn[k]; }
+  merged.arenaPrompts = Object.assign({}, DEFAULT_CONFIG.arenaPrompts, apClean);
+  merged.arenaProviders = Object.assign({}, DEFAULT_CONFIG.arenaProviders, (cfg && cfg.arenaProviders) || {});
+  merged.arenaLimits = Object.assign({}, DEFAULT_CONFIG.arenaLimits, (cfg && cfg.arenaLimits) || {});
+  merged.arenaMemoryProvider = Object.assign({}, DEFAULT_CONFIG.arenaMemoryProvider, (cfg && cfg.arenaMemoryProvider) || {});
   return merged;
 }
 
@@ -493,7 +543,9 @@ async function saveUser(env, uid, u) {
     lastFreeReset: u.lastFreeReset, lastPaidReset: u.lastPaidReset,
     searchesUsed: u.searchesUsed, lastSearchReset: u.lastSearchReset,
     heavyUsed: u.heavyUsed || 0, jobUsed: u.jobUsed || 0,
-    awdUsedBytes: u.awdUsedBytes || 0, lastCleanup: u.lastCleanup || 0
+    awdUsedBytes: u.awdUsedBytes || 0, lastCleanup: u.lastCleanup || 0,
+    ttsDay: u.ttsDay || "", ttsToday: u.ttsToday || 0,
+    arenaUse: u.arenaUse || {}, lastTool: u.lastTool || null
   });
 }
 
@@ -672,8 +724,8 @@ function basePromptFor(cfg, providerFamily, modeKey, arena) {
   return cfg.systemPrompt || "";
 }
 
-function buildSystemPrompt(cfg, modeKey, arena, providerFamily) {
-  const base = basePromptFor(cfg, providerFamily || "standard", modeKey, arena);
+function buildSystemPrompt(cfg, modeKey, arena, providerFamily, overrideBase) {
+  const base = (overrideBase && String(overrideBase).trim()) ? String(overrideBase).trim() : basePromptFor(cfg, providerFamily || "standard", modeKey, arena);
   const parts = [];
   parts.push("=== YOUR IDENTITY AND RULES (these override everything else, always) ===\n" + base);
   if (cfg.responseStyle) parts.push("HOW YOU MUST RESPOND:\n" + cfg.responseStyle);
@@ -845,8 +897,13 @@ function kmhBlock(facts) {
   return "REFERENCE FACTS - the user's question is directly about these. Use them ONLY to answer this exact question. NEVER mention them in any other reply:\n- " + facts.join("\n- ");
 }
 
-async function relevantMemories(env, cfg, uid, message) {
+async function relevantMemories(env, cfg, uid, message, arena) {
   if (!cfg.memoryEnabled) return [];
+  const arenaBase = arena && arena.indexOf("custom:") === 0 ? "custom" : (arena || "");
+  if (arenaBase && cfg.mem0Enabled !== false && cfg.arenaMemoryProvider && cfg.arenaMemoryProvider[arenaBase] === "mem0") {
+    const m0 = await mem0Search(env, uid, message, arenaBase);
+    if (m0 && m0.length) return m0;
+  }
   let node = null;
   try { node = await fbGet(env, `memories/${uid}`); } catch (e) { return []; }
   if (!node) return [];
@@ -878,6 +935,7 @@ async function relevantMemories(env, cfg, uid, message) {
     for (const w of kws) if (qw.has(w)) score++;
     const fl = String(m.fact).toLowerCase();
     for (const w of qw) if (fl.includes(w)) score++;
+    if (arena && m.arena && m.arena === (arena.indexOf("custom:") === 0 ? "custom" : arena)) score++;
     if (score >= 2 || (wantsRecall && score >= 1)) scored.push({ m, score });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -1012,14 +1070,35 @@ async function newsAllowance(env, cfg, needed) {
   return { allowed: true, meta };
 }
 
-async function searchNewsWorker(env, cfg, query, count) {
+async function newsFeedAllowance(env, cfg, commit) {
+  let meta = null;
+  try { meta = await fbGet(env, "newsFeedMeta"); } catch (e) {}
+  const day = new Date().toISOString().slice(0, 10);
+  if (!meta || meta.day !== day) meta = { day, pulls: 0 };
+  const limit = cfg.newsFeedDailyLimit === undefined ? 10 : cfg.newsFeedDailyLimit;
+  if (!isUnlimited(limit) && (meta.pulls || 0) >= limit) return { allowed: false };
+  if (commit) {
+    meta.pulls = (meta.pulls || 0) + 1;
+    try { await fbSet(env, "newsFeedMeta", meta); } catch (e) {}
+  }
+  return { allowed: true };
+}
+
+async function searchNewsWorker(env, cfg, query, count, opts) {
   const key = "newsCache/" + safeKey(query.toLowerCase().slice(0, 80));
+  let stale = null;
   try {
     const cached = await fbGet(env, key);
-    if (cached && cached.fetchedAt && nowMs() - cached.fetchedAt < (cfg.newsCacheMinutes || 60) * 60000 && cached.results && cached.results.length) {
-      return { ok: true, results: cached.results.slice(0, count), cached: true };
+    if (cached && cached.results && cached.results.length) {
+      if (cached.fetchedAt && nowMs() - cached.fetchedAt < (cfg.newsCacheMinutes || 60) * 60000) {
+        return { ok: true, results: cached.results.slice(0, count), cached: true };
+      }
+      stale = cached.results;
     }
   } catch (e) {}
+  if (opts && opts.staleOk && stale) {
+    return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+  }
   const allow = await newsAllowance(env, cfg, 1);
   if (!allow.allowed) return { ok: false, limited: true, results: [] };
   const base = cfg.newsSearchWorker;
@@ -1034,7 +1113,7 @@ async function searchNewsWorker(env, cfg, query, count) {
       snippet: String(r.text || r.snippet || r.content || r.description || "").slice(0, 900)
     }));
     if (results.length) await fbSet(env, key, { results, fetchedAt: nowMs() });
-    return { ok: results.length > 0, results };
+    return { ok: results.length > 0, results, fresh: true };
   } catch (e) { return { ok: false, results: [] }; }
 }
 
@@ -1066,6 +1145,449 @@ function canSearch(u, cfg, perms) {
   if (isUnlimited(limit)) return true;
   return (u.searchesUsed || 0) < limit;
 }
+
+/* ===================== ZAMA TOOL ENGINE (autonomous tool selection) ===================== */
+
+function explicitSearchAsk(m) {
+  const t = String(m || "").toLowerCase();
+  return /\b(search the web|browse the web|search online|browse online|google (it|for|this)|look (it |this )?up online|find information (about|on)|find info (about|on)|search for)\b/.test(t);
+}
+
+const NEARBY_KINDS = {
+  hospital: "healthcare.hospital", hospitals: "healthcare.hospital",
+  clinic: "healthcare.clinic_or_praxis", clinics: "healthcare.clinic_or_praxis",
+  pharmacy: "healthcare.pharmacy", pharmacies: "healthcare.pharmacy", chemist: "healthcare.pharmacy",
+  restaurant: "catering.restaurant", restaurants: "catering.restaurant", food: "catering.restaurant",
+  cafe: "catering.cafe", cafes: "catering.cafe", takeaway: "catering.fast_food",
+  school: "education.school", schools: "education.school", college: "education.college", university: "education.university",
+  bank: "service.financial.bank", banks: "service.financial.bank",
+  atm: "service.financial.atm", atms: "service.financial.atm",
+  shop: "commercial.supermarket", shops: "commercial.supermarket", supermarket: "commercial.supermarket", supermarkets: "commercial.supermarket", market: "commercial.marketplace", markets: "commercial.marketplace",
+  hotel: "accommodation.hotel", hotels: "accommodation.hotel", lodge: "accommodation.hotel", lodges: "accommodation.hotel", guesthouse: "accommodation.guest_house",
+  police: "service.police", church: "religion.place_of_worship.christianity", churches: "religion.place_of_worship.christianity",
+  fuel: "service.vehicle.fuel", filling: "service.vehicle.fuel", petrol: "service.vehicle.fuel",
+  bus: "public_transport.bus", parks: "leisure.park", park: "leisure.park", gym: "sport.fitness.fitness_centre", gyms: "sport.fitness.fitness_centre"
+};
+
+function nearbyKindFrom(m) {
+  const t = String(m || "").toLowerCase();
+  for (const k of Object.keys(NEARBY_KINDS)) {
+    if (new RegExp("\\b" + k + "\\b").test(t)) return k;
+  }
+  return null;
+}
+
+function isNearbyChatQuery(m) {
+  const t = String(m || "").toLowerCase();
+  const kind = nearbyKindFrom(t);
+  if (!kind) return false;
+  return /\b(near|nearby|nearest|close to|around (me|here)|in my (area|city|town)|where can i (find|get)|find me)\b/.test(t) || /\bnearby\b/.test(t);
+}
+
+function cityFromMessage(m) {
+  const mm = String(m || "").match(/\bin\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b/);
+  return mm ? mm[1].trim().slice(0, 40) : "";
+}
+
+async function geoapifyGeocode(env, city) {
+  const key = await singleKey(env, "geoapifyKey", ["GEOAPIFY_KEY"]);
+  if (!key || !city) return null;
+  const res = await fetchWithTimeout("https://api.geoapify.com/v1/geocode/search?text=" + encodeURIComponent(city + ", Zambia") + "&limit=1&apiKey=" + key, {}, 12000);
+  if (!res || !res.ok) return null;
+  try {
+    const d = await res.json();
+    const f = d.features && d.features[0];
+    if (f && f.properties) return { lat: f.properties.lat, lng: f.properties.lon };
+  } catch (e) {}
+  return null;
+}
+
+async function geoapifyPlaces(env, cfg, kind, loc) {
+  const key = await singleKey(env, "geoapifyKey", ["GEOAPIFY_KEY"]);
+  if (!key || !loc || !loc.lat) return null;
+  const cat = NEARBY_KINDS[kind] || "commercial";
+  const radius = Math.round((cfg.nearbyRadiusKm || 10) * 1000);
+  const limit = Math.min(cfg.nearbyMaxResults || 12, 20);
+  const url = "https://api.geoapify.com/v2/places?categories=" + encodeURIComponent(cat) +
+    "&filter=circle:" + loc.lng + "," + loc.lat + "," + radius +
+    "&bias=proximity:" + loc.lng + "," + loc.lat + "&limit=" + limit + "&apiKey=" + key;
+  const res = await fetchWithTimeout(url, {}, 15000);
+  if (!res || !res.ok) return null;
+  try {
+    const d = await res.json();
+    const out = [];
+    for (const f of (d.features || [])) {
+      const p = f.properties || {};
+      if (!p.name && !p.address_line1) continue;
+      out.push({
+        name: p.name || p.address_line1 || "Unnamed place",
+        address: p.formatted || p.address_line2 || "",
+        distanceM: p.distance || null,
+        lat: p.lat, lng: p.lon,
+        phone: (p.contact && p.contact.phone) || p.phone || "",
+        website: p.website || "",
+        hours: (p.opening_hours || "")
+      });
+    }
+    return out.length ? out : null;
+  } catch (e) { return null; }
+}
+
+async function mapboxPlaces(env, cfg, kind, loc) {
+  const key = await singleKey(env, "mapboxKey", ["MAPBOX_KEY", "MAPBOX_TOKEN"]);
+  if (!key || !loc || !loc.lat) return null;
+  const catMap = { hospital: "hospital", hospitals: "hospital", clinic: "medical_clinic", clinics: "medical_clinic", pharmacy: "pharmacy", pharmacies: "pharmacy", restaurant: "restaurant", restaurants: "restaurant", cafe: "cafe", cafes: "cafe", school: "school", schools: "school", bank: "bank", banks: "bank", atm: "atm", atms: "atm", hotel: "hotel", hotels: "hotel", police: "police_station", fuel: "gas_station", petrol: "gas_station", shop: "grocery", shops: "grocery", supermarket: "grocery", supermarkets: "grocery", gym: "fitness_center", gyms: "fitness_center" };
+  const cat = catMap[kind] || "shopping";
+  const url = "https://api.mapbox.com/search/searchbox/v1/category/" + encodeURIComponent(cat) +
+    "?proximity=" + loc.lng + "," + loc.lat + "&limit=" + Math.min(cfg.nearbyMaxResults || 12, 20) + "&access_token=" + key;
+  const res = await fetchWithTimeout(url, {}, 15000);
+  if (!res || !res.ok) return null;
+  try {
+    const d = await res.json();
+    const out = [];
+    for (const f of (d.features || [])) {
+      const p = f.properties || {};
+      out.push({
+        name: p.name || "Unnamed place",
+        address: p.full_address || p.place_formatted || "",
+        distanceM: p.distance || null,
+        lat: (p.coordinates && p.coordinates.latitude) || null,
+        lng: (p.coordinates && p.coordinates.longitude) || null,
+        phone: (p.metadata && p.metadata.phone) || "",
+        website: (p.metadata && p.metadata.website) || "",
+        hours: ""
+      });
+    }
+    return out.length ? out : null;
+  } catch (e) { return null; }
+}
+
+async function nearbyPlaces(env, cfg, kind, loc) {
+  let places = await geoapifyPlaces(env, cfg, kind, loc);
+  if (!places) places = await mapboxPlaces(env, cfg, kind, loc);
+  return places;
+}
+
+function placesBlock(kind, places, locLabel) {
+  let b = "REAL NEARBY PLACES (live map data from location services - these are verified real places" + (locLabel ? " near " + locLabel : "") + "; present them naturally, never invent extra places, addresses, or phone numbers):\n";
+  places.forEach((p, i) => {
+    b += (i + 1) + ". " + p.name;
+    if (p.distanceM) b += " - about " + (p.distanceM >= 1000 ? (p.distanceM / 1000).toFixed(1) + " km" : Math.round(p.distanceM) + " m") + " away";
+    if (p.address) b += "\n   Address: " + p.address;
+    if (p.phone) b += "\n   Phone: " + p.phone;
+    if (p.hours) b += "\n   Hours: " + String(p.hours).slice(0, 120);
+    if (p.website) b += "\n   Website: " + p.website;
+    b += "\n";
+  });
+  return b;
+}
+
+function isCurrencyQuery(m) {
+  const t = String(m || "").toLowerCase();
+  const hasCur = /\b(kwacha|zmw|usd|dollar|dollars|euro|euros|eur|gbp|pound|pounds|rand|zar|yen|jpy|yuan|cny|rupee|inr|kes|shilling|naira|ngn|pula|bwp)\b/.test(t);
+  if (!hasCur) return false;
+  return /\b(exchange rate|exchange|convert|conversion|how much is|worth in|rate (of|for|to)|to (zmw|kwacha|usd|dollars?|euros?|rands?|pounds?)|in (zmw|kwacha|usd|dollars?|euros?|rands?|pounds?))\b/.test(t);
+}
+
+const CUR_CODES = { kwacha: "ZMW", zmw: "ZMW", usd: "USD", dollar: "USD", dollars: "USD", euro: "EUR", euros: "EUR", eur: "EUR", gbp: "GBP", pound: "GBP", pounds: "GBP", rand: "ZAR", zar: "ZAR", yen: "JPY", jpy: "JPY", yuan: "CNY", cny: "CNY", rupee: "INR", inr: "INR", kes: "KES", shilling: "KES", naira: "NGN", ngn: "NGN", pula: "BWP", bwp: "BWP" };
+
+function currenciesFrom(m) {
+  const t = String(m || "").toLowerCase();
+  const found = [];
+  for (const w of Object.keys(CUR_CODES)) {
+    if (new RegExp("\\b" + w + "\\b").test(t) && found.indexOf(CUR_CODES[w]) === -1) found.push(CUR_CODES[w]);
+  }
+  return found;
+}
+
+async function getCurrencyRates(env, cfg, base) {
+  const b = String(base || "USD").toUpperCase().slice(0, 3);
+  const cacheKey = "currencyCache/" + b;
+  try {
+    const c = await fbGet(env, cacheKey);
+    if (c && c.at && nowMs() - c.at < (cfg.currencyCacheMinutes || 60) * 60000 && c.rates) return { ok: true, base: b, rates: c.rates, cached: true };
+  } catch (e) {}
+  let rates = null;
+  const key = await singleKey(env, "currencyKey", ["CURRENCY_KEY", "EXCHANGERATE_KEY"]);
+  if (key) {
+    const res = await fetchWithTimeout("https://v6.exchangerate-api.com/v6/" + key + "/latest/" + b, {}, 15000);
+    if (res && res.ok) { try { const d = await res.json(); if (d && d.conversion_rates) rates = d.conversion_rates; } catch (e) {} }
+  }
+  if (!rates) {
+    const res = await fetchWithTimeout("https://open.er-api.com/v6/latest/" + b, {}, 15000);
+    if (res && res.ok) { try { const d = await res.json(); if (d && d.rates) rates = d.rates; } catch (e) {} }
+  }
+  if (!rates) return { ok: false };
+  try { await fbSet(env, cacheKey, { at: nowMs(), rates }); } catch (e) {}
+  return { ok: true, base: b, rates, cached: false };
+}
+
+function currencyBlock(base, rates, wanted) {
+  const keep = ["ZMW", "USD", "EUR", "GBP", "ZAR", "CNY", "INR", "KES", "NGN", "BWP"];
+  for (const w of (wanted || [])) if (keep.indexOf(w) === -1) keep.push(w);
+  let b = "LIVE EXCHANGE RATES fetched right now (base " + base + " = 1). These are REAL current rates - use them exactly, do the math precisely, never estimate:\n";
+  for (const k of keep) { if (rates[k] !== undefined && k !== base) b += "1 " + base + " = " + rates[k] + " " + k + "\n"; }
+  return b;
+}
+
+function looksFollowUp(m) {
+  const t = String(m || "").trim();
+  if (!t || t.length > 60) return false;
+  if (/^(now|and|also|what about|how about|then|next|same for|ok now)\b/i.test(t)) return true;
+  const words = t.replace(/[?.!]/g, "").split(/\s+/);
+  return words.length <= 3;
+}
+
+async function pollinationsImage(prompt) {
+  const url = "https://image.pollinations.ai/prompt/" + encodeURIComponent(String(prompt).slice(0, 900)) + "?width=768&height=768&nologo=true";
+  const res = await fetchWithTimeout(url, {}, 45000);
+  if (!res || !res.ok) return { ok: false };
+  try {
+    const buf = await res.arrayBuffer();
+    if (!buf || buf.byteLength < 1000) return { ok: false };
+    let binary = "";
+    const bytes = new Uint8Array(buf);
+    const chunk = 8192;
+    for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    return { ok: true, image: btoa(binary), mime: "image/jpeg" };
+  } catch (e) { return { ok: false }; }
+}
+
+async function mem0Pool(env) {
+  const sec = await getSecrets(env);
+  const fromPanel = keysFrom(sec.mem0Keys);
+  if (fromPanel.length) return fromPanel;
+  return splitKeys(env.MEM0_KEYS);
+}
+
+async function mem0Add(env, uid, facts, arena) {
+  const keys = await mem0Pool(env);
+  if (!keys.length || !facts.length) return false;
+  for (const key of keys) {
+    try {
+      const res = await fetchWithTimeout("https://api.mem0.ai/v1/memories/", {
+        method: "POST",
+        headers: { "Authorization": "Token " + key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: facts.map(f => ({ role: "user", content: f })),
+          user_id: uid + (arena ? "_" + arena : ""),
+          metadata: { arena: arena || "general" }
+        })
+      }, 15000);
+      if (res && res.ok) return true;
+    } catch (e) {}
+  }
+  return false;
+}
+
+async function mem0Search(env, uid, query, arena) {
+  const keys = await mem0Pool(env);
+  if (!keys.length) return null;
+  for (const key of keys) {
+    try {
+      const res = await fetchWithTimeout("https://api.mem0.ai/v1/memories/search/", {
+        method: "POST",
+        headers: { "Authorization": "Token " + key, "Content-Type": "application/json" },
+        body: JSON.stringify({ query: String(query).slice(0, 400), user_id: uid + (arena ? "_" + arena : ""), limit: 5 })
+      }, 15000);
+      if (res && res.ok) {
+        const d = await res.json();
+        const arr = Array.isArray(d) ? d : (d.results || d.memories || []);
+        const out = arr.map(x => String(x.memory || x.text || "")).filter(Boolean).slice(0, 5);
+        return out;
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+function arenaKeyName(arena) {
+  return String(arena || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+async function arenaKeyPool(env, arena, provider) {
+  const sec = await getSecrets(env);
+  const a = arenaKeyName(arena);
+  const dedicated = keysFrom(sec["arenaKeys_" + a]);
+  if (dedicated.length) return dedicated;
+  const fromEnv = splitKeys(env["ARENA_" + a.toUpperCase() + "_KEYS"]);
+  if (fromEnv.length) return fromEnv;
+  return await poolKeys(env, provider);
+}
+
+async function callArena(env, cfg, arena, arenaCfg, messages, maxTokens) {
+  const provider = String(arenaCfg.provider || "groq").toLowerCase();
+  const endpoint = PROVIDER_ENDPOINTS[provider];
+  if (!endpoint) return { ok: false, error: "unknown arena provider" };
+  const keys = await arenaKeyPool(env, arena, provider);
+  if (!keys.length) return { ok: false, error: "no arena keys" };
+  const models = [];
+  if (arenaCfg.model) models.push(String(arenaCfg.model));
+  for (const m of modelsForProvider(cfg, provider)) if (models.indexOf(m) === -1) models.push(m);
+  if (provider === "gemini" && !models.length) models.push(cfg.geminiModel || "gemini-3.5-flash");
+  for (const model of models) {
+    for (const key of keys) {
+      if (keyDead("arena_" + provider, key)) continue;
+      const r = await callOpenAICompatible(endpoint, key, model, messages, maxTokens, null, "arena_" + provider);
+      if (r.ok) return { ok: true, text: r.text, provider: provider + " (arena)", model, finish: r.finish };
+    }
+  }
+  return { ok: false, error: "arena providers busy" };
+}
+
+function arenaLimitsFor(cfg, arena) {
+  const base = arena && arena.indexOf("custom:") === 0 ? "custom" : arena;
+  return (cfg.arenaLimits && cfg.arenaLimits[base]) || {};
+}
+
+function arenaUseCount(u, arena, lims) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (!u.arenaUse) u.arenaUse = {};
+  const key = arenaKeyName(arena.indexOf("custom:") === 0 ? "custom" : arena);
+  let rec = u.arenaUse[key];
+  if (!rec || rec.day !== day) { rec = { day, used: 0 }; u.arenaUse[key] = rec; }
+  return rec;
+}
+
+/* =================== END ZAMA TOOL ENGINE =================== */
+
+/* =================== ZAMA LEARNING ENGINE (Students & Teachers) =================== */
+
+const REVIEW_DAYS = [2, 5, 12, 30];
+
+function needsDeepThink(m) {
+  const t = String(m || "").toLowerCase();
+  if (t.length < 12) return false;
+  const stem = /\b(prove|derive|derivation|integrate|integral|differentiate|derivative|simultaneous equations?|quadratic|factori[sz]e|balance (the |this )?equation|stoichiometry|moles?|molar|titration|equilibrium|trial balance|balance sheet|depreciation|ledger|journal entr(y|ies)|momentum|projectile|kinematics|circuit|resistance|vectors?|matri(x|ces)|logarithms?|probability of|theorem|geometric proof)\b/.test(t);
+  const mathy = /\b(calculate|solve|work out|compute|find the value|evaluate)\b/.test(t) && /\d/.test(t) && t.length > 40;
+  return stem || mathy;
+}
+
+function mentionsUploadedDoc(m) {
+  const t = String(m || "").toLowerCase();
+  if (!/\b(papers?|pdf|documents?|files?|worksheets?|notes|books?|exams?|tests?|assignments?|homework)\b/.test(t)) return false;
+  return /\b(attached|uploaded|i sent|i gave you|remember|we (were|are) (doing|solving|discussing|working)|that (maths?|english|science|physics|chemistry|biology|accounts?|history|civic)|the one (i|we)|question \d+|q\d+)\b/.test(t);
+}
+
+function chunkText(text, size) {
+  const s = Math.max(400, size || 1200);
+  const t = String(text || "");
+  const out = [];
+  for (let i = 0; i < t.length; i += s) out.push(t.slice(i, i + s));
+  return out;
+}
+
+function scoreChunks(chunks, message) {
+  const qw = queryWords(message);
+  const qnums = (String(message).match(/\d+/g) || []).slice(0, 6);
+  return chunks.map((c, i) => {
+    const cl = String(c).toLowerCase();
+    let score = 0;
+    for (const w of qw) if (cl.indexOf(w) !== -1) score++;
+    for (const n of qnums) {
+      if (cl.indexOf("question " + n) !== -1 || cl.indexOf("q" + n) !== -1 || cl.indexOf("q. " + n) !== -1 || cl.indexOf("\n" + n + ".") !== -1) score += 3;
+    }
+    return { i, score };
+  });
+}
+
+async function docContextFor(env, cfg, uid, arena, message, docId) {
+  let index = null;
+  try { index = await fbGet(env, `arenaDocIndex/${uid}`); } catch (e) { return ""; }
+  if (!index) return "";
+  const arenaBase = arena && arena.indexOf("custom:") === 0 ? "custom" : (arena || "");
+  let id = docId ? safeKey(docId) : "";
+  if (id && !index[id]) id = "";
+  if (!id) {
+    const qw = new Set(queryWords(message));
+    let best = null, bestScore = -1;
+    for (const k of Object.keys(index)) {
+      const d = index[k];
+      if (!d) continue;
+      let score = 0;
+      if (arenaBase && d.arena === arenaBase) score += 2;
+      const nw = String(d.name || "").toLowerCase().split(/[\s_.-]+/).filter(Boolean);
+      for (const w of nw) if (qw.has(w)) score += 2;
+      if (d.createdAt) score += d.createdAt / nowMs();
+      if (score > bestScore) { bestScore = score; best = k; }
+    }
+    id = best || "";
+  }
+  if (!id) return "";
+  let node = null;
+  try { node = await fbGet(env, `arenaDocs/${uid}/${id}/c`); } catch (e) { return ""; }
+  if (!node) return "";
+  const arr = Array.isArray(node) ? node : Object.keys(node).sort((a, b) => Number(a) - Number(b)).map(k => node[k]);
+  if (!arr.length) return "";
+  const topN = Math.max(1, cfg.arenaDocTopChunks || 6);
+  let scored = scoreChunks(arr, message).sort((a, b) => b.score - a.score);
+  let picked = scored[0] && scored[0].score > 0 ? scored.slice(0, topN).filter(x => x.score > 0) : scored.slice(0, topN);
+  picked.sort((a, b) => a.i - b.i);
+  const meta = index[id] || {};
+  let b = "UPLOADED DOCUMENT MEMORY - \"" + (meta.name || "document") + "\" (real content the user uploaded before; " + arr.length + " sections total, the most relevant are shown; trust this content and never invent parts you cannot see; if the answer may sit in an unshown section, say which section you need):\n";
+  for (const p of picked) b += "\n[Section " + (p.i + 1) + " of " + arr.length + "]\n" + String(arr[p.i]).trim() + "\n";
+  return b;
+}
+
+async function learnConsentOk(env, cfg, uid) {
+  if (cfg.requireLearningConsent === false) return true;
+  try { const c = await fbGet(env, `learnConsent/${uid}`); return !!(c && c.allow); } catch (e) { return false; }
+}
+
+async function pushMistakes(env, cfg, uid, arenaBase, items) {
+  if (!items || !items.length) return 0;
+  let node = null;
+  try { node = await fbGet(env, `mistakeBank/${uid}`); } catch (e) {}
+  const keys = node ? Object.keys(node) : [];
+  const max = cfg.mistakeBankMax || 120;
+  if (node && keys.length + items.length > max) {
+    const sorted = keys.sort((a, b) => ((node[a] && node[a].createdAt) || 0) - ((node[b] && node[b].createdAt) || 0));
+    const kill = {};
+    const removeN = Math.min(keys.length, keys.length + Math.min(items.length, 5) - max);
+    for (let i = 0; i < removeN; i++) kill[sorted[i]] = null;
+    if (removeN > 0) { try { await fbUpdate(env, `mistakeBank/${uid}`, kill); } catch (e) {} }
+  }
+  let stored = 0;
+  for (const it of items.slice(0, 5)) {
+    if (!it || !it.mistake) continue;
+    await fbPush(env, `mistakeBank/${uid}`, {
+      topic: String(it.topic || "").slice(0, 80),
+      mistake: String(it.mistake).slice(0, 300),
+      pattern: String(it.pattern || "").slice(0, 200),
+      arena: arenaBase || "",
+      createdAt: nowMs(),
+      reviewAfter: nowMs() + daysToMs(REVIEW_DAYS[0]),
+      reviews: 0
+    });
+    stored++;
+  }
+  return stored;
+}
+
+async function dueMistakes(env, cfg, uid, limitN) {
+  let node = null;
+  try { node = await fbGet(env, `mistakeBank/${uid}`); } catch (e) { return []; }
+  if (!node) return [];
+  const t = nowMs();
+  const all = [];
+  for (const k of Object.keys(node)) { const m = node[k]; if (m && m.mistake) all.push(Object.assign({ id: k }, m)); }
+  all.sort((a, b) => {
+    const ad = (a.reviewAfter || 0) <= t ? 0 : 1, bd = (b.reviewAfter || 0) <= t ? 0 : 1;
+    if (ad !== bd) return ad - bd;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+  return all.slice(0, limitN || 5);
+}
+
+function mistakesBlock(list) {
+  let b = "THIS STUDENT'S KNOWN WEAK POINTS (from their mistake bank - use them to coach, to warn before they repeat a pattern, and to choose practice questions; be kind and honest, never mock, never dump the whole list at once):\n";
+  list.forEach((m, i) => {
+    b += (i + 1) + ". " + (m.topic ? "[" + m.topic + "] " : "") + m.mistake + (m.pattern ? " (pattern: " + m.pattern + ")" : "") + "\n";
+  });
+  return b;
+}
+
+/* =================== END ZAMA LEARNING ENGINE =================== */
 
 async function callOpenAICompatible(endpoint, key, model, messages, maxTokens, opts, provider) {
   const body = { model, messages, max_tokens: maxTokens, stream: false, temperature: GEN_PARAMS.t, top_p: GEN_PARAMS.p };
@@ -2188,11 +2710,50 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   const arena = String(body.arena || "");
+  const searchOn = body.search !== false && body.searchEnabled !== false;
+  const explicitAsk = explicitSearchAsk(message);
+
+  let customArena = null;
+  if (arena.indexOf("custom:") === 0 && cfg.customArenasEnabled !== false) {
+    try { customArena = await fbGet(env, `customArenas/${uid}/${safeKey(arena.slice(7))}`); } catch (e) {}
+    if (!customArena) return json(friendly("That custom Arena was not found. Create it again in the app."), 404);
+  }
+  const arenaCfg = arena ? (cfg.arenaProviders && cfg.arenaProviders[customArena ? "custom" : arena]) : null;
+  const arenaLims = arena ? arenaLimitsFor(cfg, arena) : {};
+  if (arena && !isAdmin && arenaLims.dailyMessages && !isUnlimited(arenaLims.dailyMessages)) {
+    const rec = arenaUseCount(u, arena, arenaLims);
+    if (rec.used >= Number(arenaLims.dailyMessages)) {
+      await saveUser(env, uid, u);
+      return json({ ok: false, limitHit: true, message: cfg.arenaLimitMessage }, 402);
+    }
+  }
+  const arenaSearchOk = !arena || arenaLims.webSearch !== false;
+  const arenaMemoryOk = !arena || arenaLims.memory !== false;
+  if (arena && images.length && arenaLims.maxImages !== undefined && !isUnlimited(arenaLims.maxImages)) {
+    const capI = Math.max(0, Number(arenaLims.maxImages) || 0);
+    if (images.length > capI) images.length = capI;
+    if (!message && !images.length) return json(friendly("Images are limited in this Arena."), 403);
+  }
+
+  let arenaSetupBlock = "";
+  if (arena && String(body.message || "").length) {
+    const setup = body.arenaSetup && typeof body.arenaSetup === "object" ? body.arenaSetup
+      : await fbGet(env, `arenaSetup/${uid}/${safeKey(customArena ? arena.slice(7) : arena)}`).catch(() => null);
+    if (setup) {
+      const bits = [];
+      for (const k of ["name", "goals", "preferences", "learningStyle", "instructions", "rules"]) {
+        if (setup[k]) bits.push(k.toUpperCase() + ": " + String(setup[k]).slice(0, 300));
+      }
+      if (bits.length) arenaSetupBlock = "THIS USER'S ARENA SETUP (personalize with this; if something is missing, work gracefully without it):\n" + bits.join("\n");
+    }
+  }
+
   const flags = deriveFlags(message, { images });
   const skills = await getSkillsFor(env, cfg, perms, message, flags);
   const skillText = skills.length ? skillsBlock(skills) : "";
 
   if (images.length) {
+    if (arena && arenaLims.vision === false && !isAdmin) return json(friendly("Vision is switched off for this Arena."), 403);
     const maxTok = providerMaxTokens(perms, afford);
     if (mode.provider === "deepseek") {
       const desc = await describeImagesForDeepseek(env, cfg, message, images, maxTok);
@@ -2232,18 +2793,76 @@ async function handleChat(env, cfg, uid, u, body, email) {
 
   const [profB, mems, cmNode] = isAckTurn ? [null, [], null] : await Promise.all([
     profileBlock(env, cfg, uid, email, body.localTime),
-    relevantMemories(env, cfg, uid, message),
+    arenaMemoryOk ? relevantMemories(env, cfg, uid, message, arena) : Promise.resolve([]),
     body.chatId ? fbGet(env, `chatMem/${uid}/${safeKey(body.chatId)}`).catch(() => null) : Promise.resolve(null)
   ]);
   if (profB) contextBlocks.push(profB);
+  if (arenaSetupBlock && !isAckTurn) contextBlocks.push(arenaSetupBlock);
   const chatSummary = (cmNode && cmNode.summary) ? cmNode.summary : null;
   const memB = memoryBlock(mems, chatSummary);
   if (memB) contextBlocks.push(memB);
 
+  // Learning engine: uploaded-document memory + mistake bank coaching
+  const arenaBaseKey = arena.indexOf("custom:") === 0 ? "custom" : arena;
+  const learnArena = !!arena && (cfg.learningArenas || ["students", "teachers"]).indexOf(arenaBaseKey) !== -1;
+  if (!isAckTurn && cfg.arenaDocsEnabled !== false && (body.docId || (arena && mentionsUploadedDoc(message)))) {
+    const dBlock = await docContextFor(env, cfg, uid, arena, message, body.docId);
+    if (dBlock) contextBlocks.push(dBlock);
+  }
+  if (!isAckTurn && learnArena && arenaMemoryOk && cfg.mistakeBankEnabled !== false && (await learnConsentOk(env, cfg, uid))) {
+    const due = await dueMistakes(env, cfg, uid, 5);
+    if (due.length) contextBlocks.push(mistakesBlock(due));
+  }
+
   const kmhFirst = (cfg.searchFirst || "kmh") === "kmh";
   const wantsCurrent = needsCurrentInfo(message);
   const newsWanted = isNewsQuery(message);
-  const geminiMode = mode.provider === "gemini";
+  const geminiMode = mode.provider === "gemini" && !arenaCfg;
+
+  // ---- Dedicated tools first: the AI must never web-browse when a real tool exists ----
+  const lastTool = (u.lastTool && u.lastTool.at && nowMs() - u.lastTool.at < 45 * 60000) ? u.lastTool : null;
+  const followUp = looksFollowUp(message);
+  let usedDedicatedTool = false;
+
+  // NEARBY: fresh nearby question, OR a short follow-up after a nearby question ("now pharmacies")
+  let nearbyKind = null;
+  if (!isAckTurn && cfg.nearbyProvider !== "web") {
+    if (isNearbyChatQuery(message)) nearbyKind = nearbyKindFrom(message);
+    else if (followUp && lastTool && lastTool.name === "nearby") nearbyKind = nearbyKindFrom(message);
+  }
+  if (nearbyKind) {
+    let loc = null;
+    if (body.lat && body.lng) loc = { lat: Number(body.lat), lng: Number(body.lng) };
+    let cityLabel = cityFromMessage(message) || (lastTool && lastTool.name === "nearby" && lastTool.city) || "";
+    if (!loc && !cityLabel) {
+      try { const p = await fbGet(env, `profiles/${uid}`); if (p && p.city) cityLabel = p.city; } catch (e) {}
+    }
+    if (!loc && cityLabel) loc = await geoapifyGeocode(env, cityLabel);
+    if (lastTool && lastTool.name === "nearby" && !loc && lastTool.lat) loc = { lat: lastTool.lat, lng: lastTool.lng };
+    if (loc) {
+      const places = await nearbyPlaces(env, cfg, nearbyKind, loc);
+      if (places && places.length) {
+        contextBlocks.push(placesBlock(nearbyKind, places, cityLabel));
+        u.lastTool = { name: "nearby", at: nowMs(), lat: loc.lat, lng: loc.lng, city: cityLabel };
+        usedDedicatedTool = true;
+      }
+    }
+  }
+
+  // CURRENCY: always live rates, never estimates ("Now euros" after a rate question also works)
+  if (!isAckTurn && !usedDedicatedTool && cfg.currencyEnabled !== false) {
+    const isCur = isCurrencyQuery(message) || (followUp && lastTool && lastTool.name === "currency" && currenciesFrom(message).length > 0);
+    if (isCur) {
+      const wanted = currenciesFrom(message);
+      const base = wanted.indexOf("ZMW") !== -1 && wanted.length > 1 ? wanted.filter(c => c !== "ZMW")[0] : (wanted[0] || "USD");
+      const cr = await getCurrencyRates(env, cfg, base);
+      if (cr.ok) {
+        contextBlocks.push(currencyBlock(cr.base, cr.rates, wanted.concat(["ZMW"])));
+        u.lastTool = { name: "currency", at: nowMs() };
+        usedDedicatedTool = true;
+      }
+    }
+  }
 
   // RAG: the app retrieves matching knowledge from the satellite (Pinecone) and
   // passes the already-gated passages here as plain text. The brain never touches
@@ -2262,7 +2881,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
     return facts.length > 0;
   };
   const tryWeb = async () => {
-    if (geminiMode && !newsWanted) return false;
+    if (!searchOn || !arenaSearchOk) return false;
+    if (geminiMode && !newsWanted && !explicitAsk) return false;
     if (!canSearch(u, cfg, perms)) return false;
     let r;
     if (newsWanted) {
@@ -2275,6 +2895,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
     }
     if (r && r.ok && r.results.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
+      u.lastTool = { name: "web", at: nowMs() };
       sources = r.results.map(s => ({ title: s.title, url: s.url }));
       contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " (use only what answers the question):\n" +
         r.results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n"));
@@ -2283,30 +2904,40 @@ async function handleChat(env, cfg, uid, u, body, email) {
     return false;
   };
 
-  if (!isAckTurn) {
-    if (kmhFirst) {
+  if (!isAckTurn && !usedDedicatedTool) {
+    const webFollowUp = followUp && lastTool && lastTool.name === "web";
+    if (explicitAsk) {
+      const hit = await tryWeb();
+      if (!hit) await tryKmh();
+    } else if (kmhFirst) {
       const hit = await tryKmh();
-      if (!hit && wantsCurrent) await tryWeb();
+      if (!hit && (wantsCurrent || webFollowUp)) await tryWeb();
     } else {
       let hit = false;
-      if (wantsCurrent) hit = await tryWeb();
+      if (wantsCurrent || webFollowUp) hit = await tryWeb();
       if (!hit) await tryKmh();
     }
   }
 
   let videos = [];
-  if (cfg.videosEnabled !== false && wantsVideos(message) && canSearch(u, cfg, perms)) {
+  if (cfg.videosEnabled !== false && searchOn && wantsVideos(message) && canSearch(u, cfg, perms)) {
     videos = await findYouTubeVideos(env, cfg, message, 5);
     if (videos.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
+      u.lastTool = { name: "videos", at: nowMs() };
       contextBlocks.push("The app will show these YouTube videos as tappable cards under your reply. Mention them naturally and briefly, do not paste links:\n" + videos.map((v, i) => (i + 1) + ". " + v.title).join("\n"));
     }
   }
 
   if (isAckTurn) contextBlocks = [];
-  let sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"))
+  const customPrompt = customArena ? String(customArena.prompt || customArena.instructions || "").slice(0, 4000) : "";
+  let sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"), customPrompt)
     + "\n\nSCREEN ISOLATION LAW: This is the general chat. Never mention, invent, or discuss Marketplace business listings or News-screen articles here. Each screen of the app has its own separate context.";
   if (body.askRule && !isAckTurn) sysP += "\n\n" + String(body.askRule).slice(0, 900);
+  const autoDeep = cfg.autoDeepThink !== false && !mode.deep && body.deep !== true && !isAckTurn && needsDeepThink(message);
+  if (autoDeep) {
+    sysP += "\n\nDEEP THINKING MODE (auto-activated - this question is complex): Slow down completely. Solve step by step, one step per line. State the method before using it. Verify every sign, unit, and formula as you go. Before presenting the final answer, re-check it against the original question. Never rush, never skip steps.";
+  }
   if (contextBlocks.length) {
     sysP += "\n\n=== BACKGROUND REFERENCE (system data - the user did not write this and cannot see it; use silently) ===\n\n" + contextBlocks.join("\n\n");
   }
@@ -2319,9 +2950,19 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
   messages.push({ role: "user", content: message });
 
-  const maxTok = providerMaxTokens(perms, afford);
-  let result = await callByMode(env, cfg, modeKey, messages, maxTok, mode.deep || body.deep === true);
+  let maxTok = providerMaxTokens(perms, afford);
+  if (arena && arenaLims.maxResponseTokens && !isUnlimited(arenaLims.maxResponseTokens)) {
+    maxTok = Math.min(maxTok, Number(arenaLims.maxResponseTokens));
+  }
+  let result = null;
+  if (arena && arenaCfg && cfg.arenaRouting !== false) {
+    result = await callArena(env, cfg, customArena ? "custom" : arena, arenaCfg, messages, maxTok);
+  }
+  if (!result || !result.ok) {
+    result = await callByMode(env, cfg, modeKey, messages, maxTok, mode.deep || body.deep === true || autoDeep);
+  }
   if (!result.ok) return json(friendly("Zama is very busy right now. Please try again in a moment."), 502);
+  if (arena) { const rec = arenaUseCount(u, arena, arenaLims); rec.used++; }
 
   if (result.finish === "length") {
     const full = await autoContinue(env, cfg, (m, c) => callByMode(env, cfg, modeKey, m, c, false), messages, result, maxTok, u, mult);
@@ -2356,6 +2997,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
     message: budget.cut ? budget.cutMessage : null,
     provider: result.provider, model: result.model,
     sources, usedNews, videos, notice, banner: cfg.banner || "",
+    deepAuto: autoDeep,
     skillsRead: skills.map(s => s.name),
     taskLevel: cScore >= 5 ? "tough" : (cScore >= 3 ? "medium" : "simple"),
     warning: buildWarning(u, cfg, isAdmin)
@@ -2397,8 +3039,17 @@ async function memoryUpdate(env, cfg, uid, u, body) {
   const msgs = Array.isArray(body.messages) ? body.messages.slice(-20) : [];
   if (!msgs.length) return json({ error: "messages required" }, 400);
   const convo = msgs.map(m => (m.role === "user" ? "USER: " : "ZAMA: ") + String(m.content || "").slice(0, 400)).join("\n");
+  const arena = String(body.arena || "");
+  const arenaBase = arena.indexOf("custom:") === 0 ? "custom" : arena;
+  const la = {};
+  for (const k of (cfg.learningArenas || ["students", "teachers"])) la[k] = 1;
+  const isLearning = !!la[arenaBase];
+  const consented = isLearning ? await learnConsentOk(env, cfg, uid) : false;
+  const extractRules = (isLearning && consented)
+    ? "You extract this student's learning record from a session. Output ONLY a JSON array. Each item is EITHER a lasting fact: {\"fact\":\"...\",\"keywords\":\"word1 word2 word3\"} (subjects studied, topics covered, questions solved, questions left unsolved and which numbers, strengths, goals, preferences, how they learn best) OR a mistake: {\"mistake\":\"exactly what went wrong\",\"topic\":\"subject - topic\",\"pattern\":\"the habit behind it, e.g. forgets to change the sign\"}. Small mistakes matter a lot - record them precisely. Maximum 5 facts and 5 mistakes. If nothing important, output []."
+    : "You extract only IMPORTANT lasting facts about the user from a conversation: their name, goals, projects, preferences, key life facts. Never extract small talk or temporary details. Output ONLY a JSON array like [{\"fact\":\"...\",\"keywords\":\"word1 word2 word3\"}]. Maximum 5 facts. If nothing important, output [].";
   const res = await callStandard(env, cfg, [
-    { role: "system", content: "You extract only IMPORTANT lasting facts about the user from a conversation: their name, goals, projects, preferences, key life facts. Never extract small talk or temporary details. Output ONLY a JSON array like [{\"fact\":\"...\",\"keywords\":\"word1 word2 word3\"}]. Maximum 5 facts. If nothing important, output []." },
+    { role: "system", content: extractRules },
     { role: "user", content: convo }
   ], 500);
   if (!res.ok) return json({ error: "Could not process memory now." }, 502);
@@ -2406,23 +3057,80 @@ async function memoryUpdate(env, cfg, uid, u, body) {
   await saveUser(env, uid, u);
   const arr = extractJson(res.text);
   let stored = 0;
+  let mistakesStored = 0;
   if (Array.isArray(arr)) {
-    const existing = await fbGet(env, `memories/${uid}`, "shallow=true");
-    const count = existing ? Object.keys(existing).length : 0;
-    for (const f of arr.slice(0, 5)) {
-      if (f && f.fact) {
-        if (count + stored >= (cfg.maxMemories || 200)) break;
-        await fbPush(env, `memories/${uid}`, {
-          fact: String(f.fact).slice(0, 400),
-          keywords: String(f.keywords || "").slice(0, 200),
-          chatId: body.chatId ? safeKey(body.chatId) : "",
-          createdAt: nowMs()
-        });
-        stored++;
+    if (isLearning && consented && cfg.mistakeBankEnabled !== false) {
+      const mk = arr.filter(x => x && x.mistake);
+      if (mk.length) mistakesStored = await pushMistakes(env, cfg, uid, arenaBase, mk);
+    }
+    const facts = arr.filter(f => f && f.fact).slice(0, 5).map(f => String(f.fact).slice(0, 400));
+    const useMem0 = arenaBase && cfg.mem0Enabled !== false && cfg.arenaMemoryProvider && cfg.arenaMemoryProvider[arenaBase] === "mem0";
+    let mem0Done = false;
+    if (useMem0 && facts.length) {
+      mem0Done = await mem0Add(env, uid, facts, arenaBase);
+      if (mem0Done) stored = facts.length;
+    }
+    if (!mem0Done) {
+      const existing = await fbGet(env, `memories/${uid}`, "shallow=true");
+      const count = existing ? Object.keys(existing).length : 0;
+      for (const f of arr.filter(x => x && x.fact).slice(0, 5)) {
+        if (f && f.fact) {
+          if (count + stored >= (cfg.maxMemories || 200)) break;
+          await fbPush(env, `memories/${uid}`, {
+            fact: String(f.fact).slice(0, 400),
+            keywords: String(f.keywords || "").slice(0, 200),
+            chatId: body.chatId ? safeKey(body.chatId) : "",
+            arena: arenaBase || "",
+            createdAt: nowMs()
+          });
+          stored++;
+        }
       }
     }
   }
-  return json({ ok: true, stored });
+  return json({ ok: true, stored, mistakesStored });
+}
+
+async function arenaRevision(env, cfg, uid, u, body) {
+  if (cfg.revisionEnabled === false) return json(friendly("Revision is switched off right now."), 403);
+  const isAdmin = uid === ADMIN_UID;
+  const afford = maxAffordableChars(u, cfg, 1, isAdmin);
+  if (afford < (cfg.charsPerUnit || 500)) {
+    return json({ ok: false, limitHit: true, message: u.plan === "paid" ? cfg.paidLimitMessage : cfg.upgradeMessage }, 402);
+  }
+  const arena = String(body.arena || "students");
+  const topic = String(body.topic || "").slice(0, 100);
+  const minutes = Math.max(5, Math.min(Number(body.minutes) || 15, 120));
+  const due = await dueMistakes(env, cfg, uid, 10);
+  const mems = await relevantMemories(env, cfg, uid, "revision lessons learnt " + (topic || "recently"), arena);
+  let docBlock = "";
+  if (body.docId) docBlock = await docContextFor(env, cfg, uid, arena, topic || "revision questions", body.docId);
+  if (!due.length && !mems.length && !docBlock) {
+    return json(friendly("Zama has nothing saved to revise yet. Learn a little first - then revision becomes truly powerful."), 404);
+  }
+  const parts = [];
+  if (due.length) parts.push(mistakesBlock(due));
+  if (mems.length) parts.push("WHAT THE STUDENT HAS LEARNT (from memory):\n- " + mems.join("\n- "));
+  if (docBlock) parts.push(docBlock);
+  const perms = u.plan === "paid" ? cfg.paidPerms : cfg.freePerms;
+  const messages = [
+    { role: "system", content: buildSystemPrompt(cfg, "normal", arena, "standard") + "\n\nYou are creating a PERSONAL revision paper from this student's real history below. Target their weak points first - especially patterns behind past mistakes. Structure: a short title line, then numbered practice questions (hardest weak areas get more questions), then an ANSWERS section at the end with honest one-line tips on the pattern behind each related past mistake. It must fit a " + minutes + "-minute session. Use ONLY the history provided - never invent progress." },
+    { role: "user", content: parts.join("\n\n") + "\n\nCreate my revision paper now" + (topic ? ", focused on: " + topic : "") + "." }
+  ];
+  let r = await callStandard(env, cfg, messages, providerMaxTokens(perms, afford));
+  if (r.ok && r.finish === "length") {
+    const full = await autoContinue(env, cfg, (m, c) => callStandard(env, cfg, m, c), messages, r, providerMaxTokens(perms, afford), u, 1);
+    r = Object.assign({}, r, { text: full });
+  }
+  if (!r.ok) return json(friendly("Zama is busy right now. Please try again shortly."), 502);
+  const budget = await enforceBudget(env, cfg, uid, u, r.text, 1, { type: "revision", arena });
+  await saveUser(env, uid, u);
+  return json({
+    ok: true,
+    title: "Revision Paper" + (topic ? " - " + topic : ""),
+    content: budget.text, cut: budget.cut, message: budget.cut ? budget.cutMessage : null,
+    coveredMistakes: due.length, minutes
+  });
 }
 
 async function chatMemoryUpdate(env, cfg, uid, u, body) {
@@ -2711,7 +3419,12 @@ async function handleNewsFeed(env, cfg, uid, u, body) {
   if (!canSearch(u, cfg, perms) && uid !== ADMIN_UID) {
     return json(friendly("News is resting for now. It will be back after your usage reset."), 403);
   }
-  const r = await searchNewsWorker(env, cfg, topic, 20);
+  const daily = await newsFeedAllowance(env, cfg, false);
+  const r = await searchNewsWorker(env, cfg, topic, 20, { staleOk: !daily.allowed });
+  if (r.fresh) await newsFeedAllowance(env, cfg, true);
+  if (!daily.allowed && (!r.results || !r.results.length)) {
+    return json(friendly("Today's fresh news pulls are done. Cached news will show, and fresh news returns tomorrow."), 429);
+  }
   if (r.limited && (!r.results || !r.results.length)) {
     return json(friendly("Fresh news is taking a short break. Please check again soon."), 429);
   }
@@ -2763,6 +3476,32 @@ async function handleNearby(env, cfg, uid, u, body, email) {
   if (!canSearch(u, cfg, perms) && !isAdmin) return json(friendly("Search is resting until your usage reset."), 403);
   const afford = maxAffordableChars(u, cfg, 1, isAdmin);
   if (afford < (cfg.charsPerUnit || 500)) return json({ ok: false, limitHit: true, message: u.plan === "paid" ? cfg.paidLimitMessage : cfg.upgradeMessage }, 402);
+
+  // Real location APIs first (Geoapify -> Mapbox). Web search is only a last resort.
+  if (cfg.nearbyProvider !== "web") {
+    let loc = (body.lat && body.lng) ? { lat: Number(body.lat), lng: Number(body.lng) } : await geoapifyGeocode(env, city);
+    if (loc) {
+      const kindKey = nearbyKindFrom(kind) || kind.toLowerCase();
+      const places = await nearbyPlaces(env, cfg, kindKey, loc);
+      if (places && places.length) {
+        const profB2 = await profileBlock(env, cfg, uid, email, body.localTime);
+        const messages2 = [
+          { role: "system", content: buildSystemPrompt(cfg, "normal", "", "standard") + (profB2 ? "\n\n" + profB2 : "") + "\n\nYou are presenting REAL nearby places from live map data. Use ONLY the places listed. Present them clearly with distance, address, and contact details when given. Never invent places, addresses, or phone numbers." },
+          { role: "user", content: "The user is in " + city + " and needs: " + kind + ".\n\n" + placesBlock(kindKey, places, city) + "\n\nGive the best organised, honest answer." }
+        ];
+        let rr = await callStandard(env, cfg, messages2, providerMaxTokens(perms, afford));
+        if (!rr.ok) rr = { ok: true, text: places.map((p, i) => (i + 1) + ". " + p.name + (p.address ? " - " + p.address : "") + (p.phone ? " - " + p.phone : "")).join("\n") };
+        const budget2 = await enforceBudget(env, cfg, uid, u, rr.text, 1, null);
+        u.lastTool = { name: "nearby", at: nowMs(), lat: loc.lat, lng: loc.lng, city };
+        await saveUser(env, uid, u);
+        return json({
+          ok: true, text: budget2.text, cut: budget2.cut, message: budget2.cut ? budget2.cutMessage : null, city,
+          places: places.map(p => ({ name: p.name, address: p.address, lat: p.lat, lng: p.lng, distanceM: p.distanceM, phone: p.phone, website: p.website, hours: p.hours })),
+          sources: []
+        });
+      }
+    }
+  }
 
   const termSets = {
     hospital: ["hospitals in", "clinics in", "medical centre", "emergency health services", "pharmacy in"],
@@ -2904,14 +3643,22 @@ export default {
 
         case "/image": {
           if (!cfg.imageGenEnabled) return json({ error: "Image generation is disabled." }, 403);
-          const prompt = String(body.prompt || "").trim();
+          let prompt = String(body.prompt || "").trim();
           if (!prompt) return json({ error: "prompt required" }, 400);
+          if (cfg.imagePromptEnhance !== false && body.enhance !== false) {
+            const enh = await callStandard(env, cfg, [
+              { role: "system", content: "You turn a user's image request into ONE excellent image generation prompt: subject, style, lighting, composition, quality words. Output ONLY the prompt text, under 90 words, nothing else." },
+              { role: "user", content: prompt.slice(0, 600) }
+            ], 200);
+            if (enh.ok && enh.text && enh.text.trim().length > 10) prompt = enh.text.trim().slice(0, 900);
+          }
           let r = { ok: false };
           if (cfg.cfImageEnabled !== false) {
             const cf = await cfAI(env, cfg.cfImageModel || "@cf/black-forest-labs/flux-1-schnell", { prompt: prompt.slice(0, 1800) });
             if (cf.ok && cf.out && cf.out.image) r = { ok: true, image: cf.out.image, mime: "image/jpeg", text: "" };
           }
           if (!r.ok) r = await callGeminiImage(env, cfg, prompt);
+          if (!r.ok && cfg.pollinationsEnabled !== false) r = await pollinationsImage(prompt);
           if (!r.ok) return json(friendly("Image creation is resting right now. Please try again shortly."), 502);
           deductTokens(u, cfg, unitCost(cfg, 2));
           await saveUser(env, uid, u);
@@ -3199,6 +3946,176 @@ export default {
           u.searchesUsed = (u.searchesUsed || 0) + 1;
           await saveUser(env, uid, u);
           return json({ ok: true, videos: v });
+        }
+
+        case "/currency": {
+          if (cfg.currencyEnabled === false) return json(friendly("Currency is switched off right now."), 403);
+          const base = String(body.base || "USD").toUpperCase().slice(0, 3);
+          const cr = await getCurrencyRates(env, cfg, base);
+          if (!cr.ok) return json(friendly("Live rates are resting right now. Please try again shortly."), 502);
+          return json({ ok: true, base: cr.base, rates: cr.rates, cached: !!cr.cached });
+        }
+
+        case "/arena/custom/save": {
+          if (cfg.customArenasEnabled === false) return json(friendly("Custom Arenas are switched off."), 403);
+          const name = String(body.name || "").trim().slice(0, 60);
+          const prompt = String(body.prompt || body.instructions || "").trim().slice(0, 4000);
+          if (!name) return json(friendly("Give your Arena a name."), 400);
+          if (!prompt) return json(friendly("Write instructions for your Arena."), 400);
+          const existing = await fbGet(env, `customArenas/${uid}`, "shallow=true");
+          const count = existing ? Object.keys(existing).length : 0;
+          let id = safeKey(body.id || "");
+          if (!id && count >= (cfg.customArenaMax || 20)) return json(friendly("You've reached your custom Arena limit."), 403);
+          if (!id) id = newId();
+          await fbSet(env, `customArenas/${uid}/${id}`, { name, prompt, createdAt: nowMs(), updatedAt: nowMs() });
+          return json({ ok: true, id, arena: "custom:" + id, name });
+        }
+        case "/arena/custom/list": {
+          const node = await fbGet(env, `customArenas/${uid}`);
+          const out = [];
+          if (node) for (const k of Object.keys(node)) { const a = node[k]; if (a) out.push({ id: k, arena: "custom:" + k, name: a.name || k, prompt: a.prompt || "" }); }
+          return json({ ok: true, arenas: out });
+        }
+        case "/arena/custom/delete": {
+          const id = safeKey(body.id || "");
+          if (!id) return json(friendly("Which Arena?"), 400);
+          await fbDelete(env, `customArenas/${uid}/${id}`);
+          return json({ ok: true });
+        }
+
+        case "/arena/setup/save": {
+          const aKey = safeKey(String(body.arena || "").replace(/^custom:/, ""));
+          if (!aKey) return json(friendly("Which Arena is this setup for?"), 400);
+          const setup = {};
+          for (const k of ["name", "goals", "preferences", "learningStyle", "instructions", "rules"]) {
+            if (body[k]) setup[k] = String(body[k]).slice(0, 400);
+          }
+          await fbSet(env, `arenaSetup/${uid}/${aKey}`, setup);
+          return json({ ok: true });
+        }
+
+        case "/arenas/get": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          return json({
+            ok: true,
+            arenaPrompts: cfg.arenaPrompts || {},
+            arenaProviders: cfg.arenaProviders || {},
+            arenaLimits: cfg.arenaLimits || {},
+            arenaMemoryProvider: cfg.arenaMemoryProvider || {},
+            providerModels: Object.assign({}, PROVIDER_MODELS, cfg.providerModels || {}),
+            arenaRouting: cfg.arenaRouting !== false,
+            learning: {
+              learningArenas: cfg.learningArenas || ["students", "teachers"],
+              autoDeepThink: cfg.autoDeepThink !== false,
+              mistakeBankEnabled: cfg.mistakeBankEnabled !== false,
+              mistakeBankMax: cfg.mistakeBankMax || 120,
+              requireLearningConsent: cfg.requireLearningConsent !== false,
+              arenaDocsEnabled: cfg.arenaDocsEnabled !== false,
+              arenaDocsMax: cfg.arenaDocsMax || 10,
+              arenaDocMaxChars: cfg.arenaDocMaxChars || 120000,
+              revisionEnabled: cfg.revisionEnabled !== false
+            }
+          });
+        }
+        case "/arenas/save": {
+          if (uid !== ADMIN_UID) return json(friendly("Admins only."), 403);
+          const patch = {};
+          if (body.arenaPrompts && typeof body.arenaPrompts === "object") patch.arenaPrompts = body.arenaPrompts;
+          if (body.arenaProviders && typeof body.arenaProviders === "object") patch.arenaProviders = body.arenaProviders;
+          if (body.arenaLimits && typeof body.arenaLimits === "object") patch.arenaLimits = body.arenaLimits;
+          if (body.arenaMemoryProvider && typeof body.arenaMemoryProvider === "object") patch.arenaMemoryProvider = body.arenaMemoryProvider;
+          if (body.arenaRouting !== undefined) patch.arenaRouting = body.arenaRouting !== false;
+          for (const k of ["learningArenas", "autoDeepThink", "mistakeBankEnabled", "mistakeBankMax", "requireLearningConsent", "arenaDocsEnabled", "arenaDocsMax", "arenaDocMaxChars", "revisionEnabled"]) {
+            if (body[k] !== undefined) patch[k] = body[k];
+          }
+          if (!Object.keys(patch).length) return json(friendly("Nothing to save."), 400);
+          await fbUpdate(env, "config", patch);
+          return json({ ok: true, saved: Object.keys(patch) });
+        }
+
+        case "/doc/save": {
+          if (cfg.arenaDocsEnabled === false) return json(friendly("Document memory is switched off."), 403);
+          const name = String(body.name || "document").slice(0, 100);
+          const text = String(body.text || "");
+          if (text.trim().length < 40) return json(friendly("That document looks empty. If it's a scanned PDF, send its pages as images instead."), 400);
+          const arenaBase = String(body.arena || "").replace(/^custom:/, "").slice(0, 40) || "general";
+          let index = null;
+          try { index = await fbGet(env, `arenaDocIndex/${uid}`); } catch (e) {}
+          const lims = arenaLimitsFor(cfg, arenaBase);
+          const maxDocs = (lims.maxDocs !== undefined && !isUnlimited(lims.maxDocs)) ? Number(lims.maxDocs) : (cfg.arenaDocsMax || 10);
+          const inArena = index ? Object.keys(index).filter(k => index[k] && index[k].arena === arenaBase) : [];
+          if (inArena.length >= maxDocs && uid !== ADMIN_UID) {
+            return json(friendly("You've reached your saved document limit for this Arena. Delete an old one first."), 403);
+          }
+          const capped = text.slice(0, cfg.arenaDocMaxChars || 120000);
+          const chunks = chunkText(capped, cfg.arenaDocChunk || 1200);
+          const id = newId();
+          await fbSet(env, `arenaDocs/${uid}/${id}`, { c: chunks });
+          await fbSet(env, `arenaDocIndex/${uid}/${id}`, { name, arena: arenaBase, chars: capped.length, sections: chunks.length, createdAt: nowMs() });
+          return json({ ok: true, docId: id, name, sections: chunks.length, truncated: capped.length < text.length });
+        }
+        case "/doc/list": {
+          let index = null;
+          try { index = await fbGet(env, `arenaDocIndex/${uid}`); } catch (e) {}
+          const out = [];
+          if (index) {
+            for (const k of Object.keys(index)) {
+              const d = index[k];
+              if (!d) continue;
+              if (body.arena && d.arena !== String(body.arena).replace(/^custom:/, "")) continue;
+              out.push({ docId: k, name: d.name || k, arena: d.arena || "", sections: d.sections || 0, chars: d.chars || 0, createdAt: d.createdAt || 0 });
+            }
+          }
+          out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          return json({ ok: true, docs: out });
+        }
+        case "/doc/delete": {
+          const id = safeKey(body.docId || "");
+          if (!id) return json(friendly("Which document?"), 400);
+          await fbDelete(env, `arenaDocs/${uid}/${id}`);
+          await fbDelete(env, `arenaDocIndex/${uid}/${id}`);
+          return json({ ok: true });
+        }
+
+        case "/arena/mistakes": {
+          let node = null;
+          try { node = await fbGet(env, `mistakeBank/${uid}`); } catch (e) {}
+          const out = []; const topics = {};
+          if (node) {
+            for (const k of Object.keys(node)) {
+              const m = node[k];
+              if (m && m.mistake) {
+                out.push(Object.assign({ id: k }, m));
+                const tp = m.topic || "general";
+                topics[tp] = (topics[tp] || 0) + 1;
+              }
+            }
+          }
+          out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          return json({ ok: true, mistakes: out.slice(0, 120), topics, dueNow: out.filter(m => (m.reviewAfter || 0) <= nowMs()).length });
+        }
+        case "/arena/mistakes/reviewed": {
+          const id = safeKey(body.id || "");
+          if (!id) return json(friendly("Which entry?"), 400);
+          const m = await fbGet(env, `mistakeBank/${uid}/${id}`);
+          if (!m) return json(friendly("That entry was not found."), 404);
+          const correct = body.correct !== false;
+          const nextReviews = correct ? (m.reviews || 0) + 1 : 0;
+          const step = Math.min(nextReviews, REVIEW_DAYS.length - 1);
+          await fbUpdate(env, `mistakeBank/${uid}/${id}`, {
+            reviews: nextReviews,
+            reviewAfter: nowMs() + daysToMs(REVIEW_DAYS[step]),
+            lastResult: correct ? "correct" : "wrong",
+            reviewedAt: nowMs()
+          });
+          return json({ ok: true, nextReviewInDays: REVIEW_DAYS[step], mastered: correct && nextReviews >= REVIEW_DAYS.length });
+        }
+
+        case "/arena/revision": return await arenaRevision(env, cfg, uid, u, body);
+
+        case "/learn/consent": {
+          await fbSet(env, `learnConsent/${uid}`, { allow: body.allow === true, at: nowMs() });
+          return json({ ok: true, allow: body.allow === true });
         }
 
         case "/awd/save": return await handleAwdSave(env, cfg, uid, u, body);
