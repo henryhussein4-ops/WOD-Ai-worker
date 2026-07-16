@@ -1087,10 +1087,9 @@ async function searchDuckDuckGo(query, count) {
   return out.length ? out : null;
 }
 
-async function searchGeneralWorker(env, cfg, query, count) {
-  const base = cfg.generalSearchWorker;
+async function searchOneWorker(base, query, count) {
   if (!base) return null;
-  const res = await fetchWithTimeout(base + (base.indexOf("?") === -1 ? "?q=" : "&q=") + encodeURIComponent(query), {}, 20000);
+  const res = await fetchWithTimeout(base + (base.indexOf("?") === -1 ? "?q=" : "&q=") + encodeURIComponent(query), {}, 8000);
   if (!res || !res.ok) return null;
   try {
     const d = await res.json();
@@ -1101,6 +1100,18 @@ async function searchGeneralWorker(env, cfg, query, count) {
       snippet: String(r.text || r.snippet || r.content || "").slice(0, 800)
     }));
   } catch (e) { return null; }
+}
+async function searchGeneralWorker(env, cfg, query, count) {
+  let r = await searchOneWorker(cfg.generalSearchWorker, query, count);
+  if (!r) r = await searchOneWorker(cfg.generalSearchWorker2, query, count);
+  else if (cfg.generalSearchWorker2 && count > 5 && r.length < count) {
+    const extra = await searchOneWorker(cfg.generalSearchWorker2, query, count - r.length);
+    if (extra) {
+      const have = r.map(x => x.url);
+      for (const e of extra) if (have.indexOf(e.url) === -1) r.push(e);
+    }
+  }
+  return r;
 }
 
 async function newsAllowance(env, cfg, needed) {
@@ -1216,6 +1227,18 @@ function cleanSearchQuery(t) {
   q = q.replace(/^(search (the )?(web|internet|online)( for)?|browse (the )?(web|internet)( for)?|google( for| it)?|look (it |this )?up( online)?|find (information|info) (about|on)|search for)[\s:,-]*/i, "");
   q = q.replace(/["'\u201c\u201d]/g, "").replace(/\s+/g, " ").trim();
   return (q || String(t).trim()).slice(0, 140);
+}
+// Build the query for "search more / any others" turns: keep the old topic,
+// add only genuinely NEW words. Returns null when this isn't really a follow-up.
+function followUpSearchQuery(lastQ, newText) {
+  let t = cleanSearchQuery(newText);
+  const extra = t
+    .replace(/\b(yes|yeah|yep|no|please|again|more|some|any|search|find|look|for|the|a|an|of|do|it|he|she|they|them|him|her|his|their|has|have|had|got|lot|lots|another|other|others|ok|okay|and|also|now|even|new|else|about|on|what|thanks?|thank|you|cool|nice|great|good|awesome|perfect)\b/gi, " ")
+    .replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
+  if (extra.length >= 4) return (lastQ + " " + extra).slice(0, 140);
+  // nothing new was said - only treat as follow-up if it sounds like "more please"
+  if (/\b(more|again|others?|another|else|continue|keep going)\b/i.test(newText)) return lastQ;
+  return null;
 }
 function explicitSearchAsk(m) {
   const t = String(m || "").toLowerCase();
@@ -2730,6 +2753,7 @@ async function wideResearch(env, cfg, uid, u, body) {
 
 async function handleChat(env, cfg, uid, u, body, email) {
   const message = String(body.message || "").trim();
+  const T0 = nowMs(); const T = {}; // per-phase timings, returned to the app
   // The user's ACTUAL words (app sends rawMessage; fallback strips wrappers)
   const userText = String(body.rawMessage || "").trim() || stripAppWrap(message);
   const images = Array.isArray(body.images) ? body.images.slice(0, cfg.maxImagesPerMessage || 4) : [];
@@ -2858,6 +2882,20 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   let contextBlocks = [];
+  // ---- Mandatory always-on rules (tiny, cheap, applied before anything else) ----
+  if (!isAckTurn) {
+    if (cfg.dockRules && String(cfg.dockRules).trim()) {
+      contextBlocks.push("DOCK RULES - MANDATORY AND SILENT. These override style preferences and apply to EVERY reply. Never mention them, never quote them:\n" +
+        String(cfg.dockRules).trim() +
+        "\nGUARD: before finalizing, silently re-check your reply against each rule above and fix any violation first.");
+    }
+    if (cfg.mathEnabled !== false) {
+      contextBlocks.push("MATH RULE: whenever your answer contains mathematical, physics, chemistry or statistics notation, write it as LaTeX - inline as \\( ... \\) and standalone equations as $$ ... $$ on their own lines. Every formula gets rendered beautifully in the app. Never write equations as plain text like x^2 or 1/2mv2, and never show raw LaTeX advice or code fences around math.");
+    }
+    if (cfg.graphsEnabled !== false) {
+      contextBlocks.push("GRAPH RULE: when the user asks to plot, graph, chart or draw a function or data, output a chart code block FIRST, then a short explanation of key features (intercepts, turning points, trend). Format exactly:\n```chart\ntype: line|bar|pie\ntitle: The Title\nLabel1: value1\nLabel2: value2\n```\nRules: one 'Label: number' pair per line, plain numbers only. For a function like y=x^2, compute 15-25 evenly spaced points yourself and use the x value as the label (e.g. '-3: 9'). Use type line for functions and trends, bar for comparisons, pie for shares. The app renders this as a real graph - never draw ASCII art graphs.");
+    }
+  }
   let sources = [];
   let usedNews = false;
   const ackT = String(message || "").trim();
@@ -2963,28 +3001,44 @@ async function handleChat(env, cfg, uid, u, body, email) {
       searchFail = (!cfg.webSearchEnabled || !perms.webSearch) ? "is switched off in the Panel settings" : "daily limit is used up";
       return false;
     }
+    // Follow-ups ("search more", "any others?") reuse the LAST topic, ask for
+    // extra results, and never show the same links twice.
+    let q = cleanSearchQuery(userText);
+    let seen = [];
+    const webFollow = (followUp || explicitAsk) && lastTool && lastTool.name === "web" && lastTool.query &&
+                      followUpSearchQuery(lastTool.query, userText) !== null;
+    if (webFollow) { q = followUpSearchQuery(lastTool.query, userText); seen = lastTool.urls || []; }
+    const wantN = webFollow ? 10 : 7;
     let r;
     if (newsWanted) {
-      r = await searchNewsWorker(env, cfg, cleanSearchQuery(userText), 8);
-      if (!r.ok && !r.limited) r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5);
-      if (r.limited) { r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5); }
+      r = await searchNewsWorker(env, cfg, q, 8);
+      if (!r.ok && !r.limited) r = await searchWeb(env, cfg, q, wantN);
+      if (r.limited) { r = await searchWeb(env, cfg, q, wantN); }
       else usedNews = r.ok;
     } else {
-      r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5);
+      r = await searchWeb(env, cfg, q, wantN);
     }
     if (r && r.ok && r.results.length) {
+      let results = r.results;
+      if (seen.length) {
+        const fresh = results.filter(x => seen.indexOf(x.url) === -1);
+        if (fresh.length) results = fresh;
+        else contextBlocks.push("NOTE: the new search returned the same pages as before - tell the user these are the best sources available on this topic right now.");
+      }
+      results = results.slice(0, 7);
       u.searchesUsed = (u.searchesUsed || 0) + 1;
-      u.lastTool = { name: "web", at: nowMs() };
-      sources = r.results.map(s => ({ title: s.title, url: s.url }));
+      u.lastTool = { name: "web", at: nowMs(), query: q, urls: seen.concat(results.map(x => x.url)).slice(-30) };
+      sources = results.map(s => ({ title: s.title, url: s.url }));
       searchFail = "";
       contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " - the web search is ALREADY DONE and these are the live results. Answer the user's question NOW with the actual findings from them, naturally and specifically. NEVER say 'let me check' or 'let me search' - the checking is finished. If these results do not truly answer the question, say honestly that the search did not find good matches for this exact question:\n" +
-        r.results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n"));
+        results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n"));
       return true;
     }
     searchFail = "failed on every search provider just now";
     return false;
   };
 
+  const tTools0 = nowMs();
   if (!isAckTurn && !usedDedicatedTool) {
     const webFollowUp = followUp && lastTool && lastTool.name === "web";
     if (explicitAsk) {
@@ -2992,13 +3046,15 @@ async function handleChat(env, cfg, uid, u, body, email) {
       if (!hit) await tryKmh();
     } else if (kmhFirst) {
       const hit = await tryKmh();
-      if (!hit && (wantsCurrent || webFollowUp)) await tryWeb();
+      if (!hit && (wantsCurrent || webFollowUp || looksUnsure(userText))) await tryWeb();
     } else {
       let hit = false;
-      if (wantsCurrent || webFollowUp) hit = await tryWeb();
+      if (wantsCurrent || webFollowUp || looksUnsure(userText)) hit = await tryWeb();
       if (!hit) await tryKmh();
     }
   }
+
+  T.tools = nowMs() - tTools0;
 
   // HONESTY GUARD: Zama must never claim it searched when it did not.
   if (!isAckTurn && !usedDedicatedTool && !sources.length) {
@@ -3054,10 +3110,14 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
   let result = null;
   if (arena && arenaCfg && cfg.arenaRouting !== false) {
+    const tAI0 = nowMs();
     result = await callArena(env, cfg, customArena ? "custom" : arena, arenaCfg, messages, maxTok);
+    T.ai = nowMs() - tAI0;
   }
   if (!result || !result.ok) {
+    const tAI0 = nowMs();
     result = await callByMode(env, cfg, modeKey, messages, maxTok, mode.deep || body.deep === true || autoDeep);
+    T.ai = nowMs() - tAI0;
   }
   if (!result.ok) return json(friendly("Zama is very busy right now. Please try again in a moment."), 502);
   if (arena) { const rec = arenaUseCount(u, arena, arenaLims); rec.used++; }
@@ -3096,6 +3156,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
     provider: result.provider, model: result.model,
     sources, usedNews, videos, notice, banner: cfg.banner || "",
     deepAuto: autoDeep,
+    timings: (function(){ T.total = nowMs() - T0; return T; })(),
     skillsRead: skills.map(s => s.name),
     taskLevel: cScore >= 5 ? "tough" : (cScore >= 3 ? "medium" : "simple"),
     warning: buildWarning(u, cfg, isAdmin)
