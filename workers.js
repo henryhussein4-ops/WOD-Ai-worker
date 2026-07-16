@@ -1031,6 +1031,38 @@ function ddgExtract(html, marker, count) {
   return items;
 }
 
+function rssItems(xml, count) {
+  const out = [];
+  const items = String(xml || "").split("<item>").slice(1, (count || 5) + 3);
+  for (const it of items) {
+    const grab = (tag) => {
+      const m = it.match(new RegExp("<" + tag + ">([\\s\\S]*?)</" + tag + ">", "i"));
+      if (!m) return "";
+      return m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]+>/g, "")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+    };
+    const title = grab("title"), link = grab("link"), desc = grab("description");
+    if (title && link) out.push({ title, url: link, snippet: desc.slice(0, 800) });
+    if (out.length >= (count || 5)) break;
+  }
+  return out.length ? out : null;
+}
+// Keyless: Bing RSS - reliable from datacenter IPs, no key, no quota
+async function searchBingRss(query, count) {
+  const res = await fetchWithTimeout(
+    "https://www.bing.com/search?format=rss&count=10&q=" + encodeURIComponent(query),
+    { headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36" } }, 10000);
+  if (!res || !res.ok) return null;
+  return rssItems(await res.text(), count);
+}
+// Keyless: Google News RSS - excellent for fresh topics (music, events, prices)
+async function searchGoogleNewsRss(query, count) {
+  const res = await fetchWithTimeout(
+    "https://news.google.com/rss/search?hl=en-US&gl=US&ceid=US:en&q=" + encodeURIComponent(query),
+    { headers: { "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36" } }, 10000);
+  if (!res || !res.ok) return null;
+  return rssItems(await res.text(), count);
+}
 async function searchDuckDuckGo(query, count) {
   const res = await fetchWithTimeout(
     "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query),
@@ -1135,6 +1167,8 @@ async function searchWeb(env, cfg, query, count) {
   let results = await searchGeneralWorker(env, cfg, query, n);
   if (!results) results = await searchTavily(env, query, n);
   if (!results) results = await searchSerper(env, query, n);
+  if (!results) results = await searchBingRss(query, n);
+  if (!results) results = await searchGoogleNewsRss(query, n);
   if (!results) results = await searchDuckDuckGo(query, n);
   if (!results) return { ok: false, results: [] };
   return { ok: true, results: results.slice(0, n) };
@@ -2900,7 +2934,10 @@ async function handleChat(env, cfg, uid, u, body, email) {
   const tryWeb = async () => {
     if (!searchOn || !arenaSearchOk) { searchFail = "is switched off"; return false; }
     if (geminiMode && !newsWanted && !explicitAsk) return false;
-    if (!canSearch(u, cfg, perms)) { searchFail = "limit for today is used up"; return false; }
+    if (!isAdmin && !canSearch(u, cfg, perms)) {
+      searchFail = (!cfg.webSearchEnabled || !perms.webSearch) ? "is switched off in the Panel settings" : "daily limit is used up";
+      return false;
+    }
     let r;
     if (newsWanted) {
       r = await searchNewsWorker(env, cfg, message, 8);
@@ -2956,7 +2993,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   let videos = [];
-  if (cfg.videosEnabled !== false && searchOn && wantsVideos(message) && canSearch(u, cfg, perms)) {
+  if (cfg.videosEnabled !== false && searchOn && wantsVideos(message) && (isAdmin || canSearch(u, cfg, perms))) {
     videos = await findYouTubeVideos(env, cfg, message, 5);
     if (videos.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
@@ -4148,6 +4185,39 @@ export default {
         }
 
         case "/arena/revision": return await arenaRevision(env, cfg, uid, u, body);
+
+        case "/search/test": {
+          if (uid !== ADMIN_UID) return json({ error: "admin only" }, 403);
+          const q = String(body.q || "Zambia news today");
+          const sec = await getSecrets(env);
+          const timed = async (fn) => {
+            const t0 = nowMs();
+            try { const r = await fn(); return { ok: !!(r && r.length), count: r ? r.length : 0, ms: nowMs() - t0 }; }
+            catch (e) { return { ok: false, count: 0, ms: nowMs() - t0, error: String(e).slice(0, 80) }; }
+          };
+          const report = {};
+          report.generalWorker = cfg.generalSearchWorker
+            ? await timed(() => searchGeneralWorker(env, cfg, q, 3))
+            : { ok: false, note: "no URL set in Panel" };
+          const tavN = keysFrom(sec.tavilyKeys).concat(splitKeys(env.TAVILY_KEYS)).length;
+          report.tavily = tavN ? Object.assign({ keys: tavN }, await timed(() => searchTavily(env, q, 3))) : { ok: false, keys: 0, note: "no keys" };
+          const serN = keysFrom(sec.serperKeys).concat(splitKeys(env.SERPER_KEYS)).length;
+          report.serper = serN ? Object.assign({ keys: serN }, await timed(() => searchSerper(env, q, 3))) : { ok: false, keys: 0, note: "no keys" };
+          report.bingRss = await timed(() => searchBingRss(q, 3));
+          report.googleNewsRss = await timed(() => searchGoogleNewsRss(q, 3));
+          report.duckduckgo = await timed(() => searchDuckDuckGo(q, 3));
+          const full = await timed(async () => { const r = await searchWeb(env, cfg, q, 3); return r && r.ok ? r.results : null; });
+          return json({
+            ok: true, query: q, providers: report, fullChain: full,
+            settings: {
+              webSearchEnabled: !!cfg.webSearchEnabled,
+              freePermsWebSearch: !!(cfg.freePerms && cfg.freePerms.webSearch),
+              freeWebSearchLimit: cfg.freeWebSearchLimit,
+              yourSearchesUsedToday: u.searchesUsed || 0,
+              youAreAdmin: true
+            }
+          });
+        }
 
         case "/learn/consent": {
           await fbSet(env, `learnConsent/${uid}`, { allow: body.allow === true, at: nowMs() });
