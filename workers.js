@@ -420,23 +420,23 @@ async function getFirebaseToken(env) {
 async function fbGet(env, path, extra) {
   const token = await getFirebaseToken(env);
   const url = `${env.FIREBASE_DB_URL}/${path}.json?access_token=${token}` + (extra ? "&" + extra : "");
-  const res = await fetch(url);
-  if (!res.ok) return null;
+  const res = await fetchWithTimeout(url, {}, 8000);
+  if (!res || !res.ok) return null;
   return await res.json();
 }
 async function fbSet(env, path, data) {
   const token = await getFirebaseToken(env);
-  const res = await fetch(`${env.FIREBASE_DB_URL}/${path}.json?access_token=${token}`, {
+  const res = await fetchWithTimeout(`${env.FIREBASE_DB_URL}/${path}.json?access_token=${token}`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data)
-  });
-  return res.ok;
+  }, 8000);
+  return !!(res && res.ok);
 }
 async function fbUpdate(env, path, data) {
   const token = await getFirebaseToken(env);
-  const res = await fetch(`${env.FIREBASE_DB_URL}/${path}.json?access_token=${token}`, {
+  const res = await fetchWithTimeout(`${env.FIREBASE_DB_URL}/${path}.json?access_token=${token}`, {
     method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data)
-  });
-  return res.ok;
+  }, 8000);
+  return !!(res && res.ok);
 }
 async function fbPush(env, path, data) {
   const token = await getFirebaseToken(env);
@@ -451,15 +451,24 @@ async function fbDelete(env, path) {
   return res.ok;
 }
 
+const VERIFY_CACHE = new Map(); // idToken -> {uid, email, at} for 5 minutes
 async function verifyUser(env, idToken) {
   if (!idToken) return null;
+  const hit = VERIFY_CACHE.get(idToken);
+  if (hit && nowMs() - hit.at < 5 * 60 * 1000) return { uid: hit.uid, email: hit.email };
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${env.FIREBASE_WEB_API_KEY}`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) }
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken }) }, 8000
     );
+    if (!res) return null;
     const data = await res.json();
-    if (data.users && data.users[0]) return { uid: data.users[0].localId, email: data.users[0].email || "" };
+    if (data.users && data.users[0]) {
+      const out = { uid: data.users[0].localId, email: data.users[0].email || "" };
+      if (VERIFY_CACHE.size > 300) VERIFY_CACHE.clear();
+      VERIFY_CACHE.set(idToken, { uid: out.uid, email: out.email, at: nowMs() });
+      return out;
+    }
   } catch (e) {}
   return null;
 }
@@ -485,7 +494,9 @@ async function profileBlock(env, cfg, uid, email, localTime) {
   return "ABOUT THE USER (use naturally and warmly when it helps - never recite this list, never over-use the name):\n" + bits.join("\n");
 }
 
+let CONFIG_CACHE = { at: 0, data: null };
 async function loadConfig(env) {
+  if (CONFIG_CACHE.data && nowMs() - CONFIG_CACHE.at < 20000) return CONFIG_CACHE.data;
   const cfg = await fbGet(env, "config");
   const merged = Object.assign({}, DEFAULT_CONFIG, cfg || {});
   merged.freePerms = Object.assign({}, DEFAULT_CONFIG.freePerms, (cfg && cfg.freePerms) || {});
@@ -497,6 +508,7 @@ async function loadConfig(env) {
   merged.arenaProviders = Object.assign({}, DEFAULT_CONFIG.arenaProviders, (cfg && cfg.arenaProviders) || {});
   merged.arenaLimits = Object.assign({}, DEFAULT_CONFIG.arenaLimits, (cfg && cfg.arenaLimits) || {});
   merged.arenaMemoryProvider = Object.assign({}, DEFAULT_CONFIG.arenaMemoryProvider, (cfg && cfg.arenaMemoryProvider) || {});
+  CONFIG_CACHE = { at: nowMs(), data: merged };
   return merged;
 }
 
@@ -1425,9 +1437,11 @@ async function callArena(env, cfg, arena, arenaCfg, messages, maxTokens) {
   if (arenaCfg.model) models.push(String(arenaCfg.model));
   for (const m of modelsForProvider(cfg, provider)) if (models.indexOf(m) === -1) models.push(m);
   if (provider === "gemini" && !models.length) models.push(cfg.geminiModel || "gemini-3.5-flash");
+  const t0 = nowMs();
   for (const model of models) {
     for (const key of keys) {
       if (keyDead("arena_" + provider, key)) continue;
+      if (nowMs() - t0 > 25000) break;
       const r = await callOpenAICompatible(endpoint, key, model, messages, maxTokens, null, "arena_" + provider);
       if (r.ok) return { ok: true, text: r.text, provider: provider + " (arena)", model, finish: r.finish };
     }
@@ -1596,7 +1610,7 @@ async function callOpenAICompatible(endpoint, key, model, messages, maxTokens, o
     body.reasoning_effort = "high";
   }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 50000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const res = await fetch(endpoint, {
       method: "POST",
@@ -1768,6 +1782,7 @@ async function singleKey(env, name, envNames) {
 async function callStandard(env, cfg, messages, maxTokens) {
   const order = cfg.providerOrder || DEFAULT_CONFIG.providerOrder;
   let lastErr = "no providers available";
+  const t0 = nowMs(); // total rotation budget so a reply can never take minutes
   for (const provider of order) {
     const keys = await poolKeys(env, provider);
     const models = modelsForProvider(cfg, provider);
@@ -1776,6 +1791,7 @@ async function callStandard(env, cfg, messages, maxTokens) {
     for (const model of models) {
       for (const key of keys) {
         if (keyDead(provider, key)) continue;
+        if (nowMs() - t0 > 32000) return { ok: false, error: "Zama's AI providers are all slow right now. Please try again in a moment." };
         const result = await callOpenAICompatible(endpoint, key, model, messages, maxTokens, null, provider);
         if (result.ok) return { ok: true, text: result.text, provider, model, finish: result.finish };
         lastErr = result.error || "error";
@@ -2786,8 +2802,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
   let sources = [];
   let usedNews = false;
   const ackT = String(message || "").trim();
-  const ackCore = /\b(ok|okay|thanks|thank|thx|ty|cool|nice|great|perfect|awesome|alright|got it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|good|done)\b/i;
-  const ackAll = /^((ok(ay)?|thanks?|thank|you|thx|ty|cool|nice|great|perfect|awesome|alright|got|it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|so|too|much|very|really|a|lot|man|please|zama|my|friend|dear|one|good|well|done|job)[\s,.!?]*)+$/i;
+  const ackCore = /\b(ok|okay|thanks|thank|thx|ty|cool|nice|great|perfect|awesome|alright|got it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|good|done|hi|hey|hello|yo|sup|morning|afternoon|evening)\b/i;
+  const ackAll = /^((ok(ay)?|thanks?|thank|you|thx|ty|cool|nice|great|perfect|awesome|alright|got|it|gotcha|understood|sure|yes|yeah|yep|no|nope|wow|haha|lol|bye|goodbye|so|too|much|very|really|a|lot|man|please|zama|my|friend|dear|one|good|well|done|job|hi|hey|hello|yo|sup|whats|what's|up|morning|afternoon|evening|night)[\s,.!?]*)+$/i;
   const isAckTurn = ackT.length > 0 && ackT.length <= 40 && ackCore.test(ackT) && ackAll.test(ackT);
   if (skillText && !isAckTurn) contextBlocks.push(skillText);
 
@@ -2880,10 +2896,11 @@ async function handleChat(env, cfg, uid, u, body, email) {
     if (facts.length) contextBlocks.push(kmhBlock(facts));
     return facts.length > 0;
   };
+  let searchFail = ""; // why the web could not be searched - used for honesty below
   const tryWeb = async () => {
-    if (!searchOn || !arenaSearchOk) return false;
+    if (!searchOn || !arenaSearchOk) { searchFail = "is switched off"; return false; }
     if (geminiMode && !newsWanted && !explicitAsk) return false;
-    if (!canSearch(u, cfg, perms)) return false;
+    if (!canSearch(u, cfg, perms)) { searchFail = "limit for today is used up"; return false; }
     let r;
     if (newsWanted) {
       r = await searchNewsWorker(env, cfg, message, 8);
@@ -2897,10 +2914,12 @@ async function handleChat(env, cfg, uid, u, body, email) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
       u.lastTool = { name: "web", at: nowMs() };
       sources = r.results.map(s => ({ title: s.title, url: s.url }));
+      searchFail = "";
       contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " (use only what answers the question):\n" +
         r.results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n"));
       return true;
     }
+    searchFail = "failed on every search provider just now";
     return false;
   };
 
@@ -2916,6 +2935,23 @@ async function handleChat(env, cfg, uid, u, body, email) {
       let hit = false;
       if (wantsCurrent || webFollowUp) hit = await tryWeb();
       if (!hit) await tryKmh();
+    }
+  }
+
+  // HONESTY GUARD: Zama must never claim it searched when it did not.
+  if (!isAckTurn && !usedDedicatedTool && !sources.length) {
+    if (explicitAsk) {
+      contextBlocks.push(
+        "SEARCH STATUS (honesty rule - overrides everything): The user explicitly asked you to search the web, but web search " +
+        (searchFail || "could not run") + ". You have NO live web results. You did NOT search. " +
+        "NEVER say you searched, never say 'here is what I found', never invent findings or fresh facts. " +
+        "Tell the user plainly that you could not search the web right now" +
+        (searchFail.indexOf("limit") > -1 ? " because the daily search limit is used up" : "") +
+        ", then help from your own knowledge and clearly mark it as your stored knowledge, possibly not current.");
+    } else if (wantsCurrent) {
+      contextBlocks.push(
+        "SEARCH STATUS: No web search ran for this reply. Do not claim you searched or present anything as fresh live data. " +
+        "If the question needs current information, say honestly that you could not check live data right now.");
     }
   }
 
