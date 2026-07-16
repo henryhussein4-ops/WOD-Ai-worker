@@ -1194,6 +1194,29 @@ function canSearch(u, cfg, perms) {
 
 /* ===================== ZAMA TOOL ENGINE (autonomous tool selection) ===================== */
 
+// The app wraps the user's words in instruction text ("[SYSTEM RULE...]",
+// "(The user is named...)"). Detectors and search queries must see ONLY the
+// user's real words, or searches turn into nonsense (e.g. searching "user").
+function stripAppWrap(m) {
+  let t = String(m || "");
+  const endRule = t.lastIndexOf("[END SYSTEM RULE]");
+  if (endRule !== -1) t = t.slice(endRule + "[END SYSTEM RULE]".length);
+  t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, " ");
+  t = t.replace(/^You are in DEEP REASONING mode[\s\S]*?Question:\s*/i, "");
+  t = t.replace(/\((?:The user|You are talking)[^)]{0,400}\)/gi, " ");
+  t = t.replace(/^\s*\[[^\]]{0,800}\]\s*/, " "); // leading [arena prompt]
+  return t.replace(/\s+/g, " ").trim();
+}
+// Turn "Search the web for X" into just "X" so providers get a real query
+function cleanSearchQuery(t) {
+  let q = String(t || "").trim();
+  q = q.replace(/^["'\u201c\u201d]+|["'\u201c\u201d]+$/g, "");
+  q = q.replace(/^(please\s+|hey[,\s]+|hi[,\s]+|zama[,\s]+)+/i, "");
+  q = q.replace(/^(can you |could you |i want you to |i need you to |i want to know )/i, "");
+  q = q.replace(/^(search (the )?(web|internet|online)( for)?|browse (the )?(web|internet)( for)?|google( for| it)?|look (it |this )?up( online)?|find (information|info) (about|on)|search for)[\s:,-]*/i, "");
+  q = q.replace(/["'\u201c\u201d]/g, "").replace(/\s+/g, " ").trim();
+  return (q || String(t).trim()).slice(0, 140);
+}
 function explicitSearchAsk(m) {
   const t = String(m || "").toLowerCase();
   return /\b(search the web|browse the web|search online|browse online|google (it|for|this)|look (it |this )?up online|find information (about|on)|find info (about|on)|search for)\b/.test(t);
@@ -2707,6 +2730,8 @@ async function wideResearch(env, cfg, uid, u, body) {
 
 async function handleChat(env, cfg, uid, u, body, email) {
   const message = String(body.message || "").trim();
+  // The user's ACTUAL words (app sends rawMessage; fallback strips wrappers)
+  const userText = String(body.rawMessage || "").trim() || stripAppWrap(message);
   const images = Array.isArray(body.images) ? body.images.slice(0, cfg.maxImagesPerMessage || 4) : [];
   if (!message && !images.length) return json({ error: "message required" }, 400);
 
@@ -2761,7 +2786,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
 
   const arena = String(body.arena || "");
   const searchOn = body.search !== false && body.searchEnabled !== false;
-  const explicitAsk = explicitSearchAsk(message);
+  const explicitAsk = explicitSearchAsk(userText);
 
   let customArena = null;
   if (arena.indexOf("custom:") === 0 && cfg.customArenasEnabled !== false) {
@@ -2798,7 +2823,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
     }
   }
 
-  const flags = deriveFlags(message, { images });
+  const flags = deriveFlags(userText, { images });
   const skills = await getSkillsFor(env, cfg, perms, message, flags);
   const skillText = skills.length ? skillsBlock(skills) : "";
 
@@ -2855,8 +2880,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
   // Learning engine: uploaded-document memory + mistake bank coaching
   const arenaBaseKey = arena.indexOf("custom:") === 0 ? "custom" : arena;
   const learnArena = !!arena && (cfg.learningArenas || ["students", "teachers"]).indexOf(arenaBaseKey) !== -1;
-  if (!isAckTurn && cfg.arenaDocsEnabled !== false && (body.docId || (arena && mentionsUploadedDoc(message)))) {
-    const dBlock = await docContextFor(env, cfg, uid, arena, message, body.docId);
+  if (!isAckTurn && cfg.arenaDocsEnabled !== false && (body.docId || (arena && mentionsUploadedDoc(userText)))) {
+    const dBlock = await docContextFor(env, cfg, uid, arena, userText, body.docId);
     if (dBlock) contextBlocks.push(dBlock);
   }
   if (!isAckTurn && learnArena && arenaMemoryOk && cfg.mistakeBankEnabled !== false && (await learnConsentOk(env, cfg, uid))) {
@@ -2865,25 +2890,25 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   const kmhFirst = (cfg.searchFirst || "kmh") === "kmh";
-  const wantsCurrent = needsCurrentInfo(message);
-  const newsWanted = isNewsQuery(message);
+  const wantsCurrent = needsCurrentInfo(userText);
+  const newsWanted = isNewsQuery(userText);
   const geminiMode = mode.provider === "gemini" && !arenaCfg;
 
   // ---- Dedicated tools first: the AI must never web-browse when a real tool exists ----
   const lastTool = (u.lastTool && u.lastTool.at && nowMs() - u.lastTool.at < 45 * 60000) ? u.lastTool : null;
-  const followUp = looksFollowUp(message);
+  const followUp = looksFollowUp(userText);
   let usedDedicatedTool = false;
 
   // NEARBY: fresh nearby question, OR a short follow-up after a nearby question ("now pharmacies")
   let nearbyKind = null;
   if (!isAckTurn && cfg.nearbyProvider !== "web") {
-    if (isNearbyChatQuery(message)) nearbyKind = nearbyKindFrom(message);
-    else if (followUp && lastTool && lastTool.name === "nearby") nearbyKind = nearbyKindFrom(message);
+    if (isNearbyChatQuery(userText)) nearbyKind = nearbyKindFrom(userText);
+    else if (followUp && lastTool && lastTool.name === "nearby") nearbyKind = nearbyKindFrom(userText);
   }
   if (nearbyKind) {
     let loc = null;
     if (body.lat && body.lng) loc = { lat: Number(body.lat), lng: Number(body.lng) };
-    let cityLabel = cityFromMessage(message) || (lastTool && lastTool.name === "nearby" && lastTool.city) || "";
+    let cityLabel = cityFromMessage(userText) || (lastTool && lastTool.name === "nearby" && lastTool.city) || "";
     if (!loc && !cityLabel) {
       try { const p = await fbGet(env, `profiles/${uid}`); if (p && p.city) cityLabel = p.city; } catch (e) {}
     }
@@ -2901,9 +2926,9 @@ async function handleChat(env, cfg, uid, u, body, email) {
 
   // CURRENCY: always live rates, never estimates ("Now euros" after a rate question also works)
   if (!isAckTurn && !usedDedicatedTool && cfg.currencyEnabled !== false) {
-    const isCur = isCurrencyQuery(message) || (followUp && lastTool && lastTool.name === "currency" && currenciesFrom(message).length > 0);
+    const isCur = isCurrencyQuery(userText) || (followUp && lastTool && lastTool.name === "currency" && currenciesFrom(userText).length > 0);
     if (isCur) {
-      const wanted = currenciesFrom(message);
+      const wanted = currenciesFrom(userText);
       const base = wanted.indexOf("ZMW") !== -1 && wanted.length > 1 ? wanted.filter(c => c !== "ZMW")[0] : (wanted[0] || "USD");
       const cr = await getCurrencyRates(env, cfg, base);
       if (cr.ok) {
@@ -2926,7 +2951,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   const tryKmh = async () => {
-    const facts = await kmhRelevantFacts(env, cfg, perms, message);
+    const facts = await kmhRelevantFacts(env, cfg, perms, userText);
     if (facts.length) contextBlocks.push(kmhBlock(facts));
     return facts.length > 0;
   };
@@ -2940,19 +2965,19 @@ async function handleChat(env, cfg, uid, u, body, email) {
     }
     let r;
     if (newsWanted) {
-      r = await searchNewsWorker(env, cfg, message, 8);
-      if (!r.ok && !r.limited) r = await searchWeb(env, cfg, message, 5);
-      if (r.limited) { r = await searchWeb(env, cfg, message, 5); }
+      r = await searchNewsWorker(env, cfg, cleanSearchQuery(userText), 8);
+      if (!r.ok && !r.limited) r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5);
+      if (r.limited) { r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5); }
       else usedNews = r.ok;
     } else {
-      r = await searchWeb(env, cfg, message, 5);
+      r = await searchWeb(env, cfg, cleanSearchQuery(userText), 5);
     }
     if (r && r.ok && r.results.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
       u.lastTool = { name: "web", at: nowMs() };
       sources = r.results.map(s => ({ title: s.title, url: s.url }));
       searchFail = "";
-      contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " (use only what answers the question):\n" +
+      contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " - the web search is ALREADY DONE and these are the live results. Answer the user's question NOW with the actual findings from them, naturally and specifically. NEVER say 'let me check' or 'let me search' - the checking is finished. If these results do not truly answer the question, say honestly that the search did not find good matches for this exact question:\n" +
         r.results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n"));
       return true;
     }
@@ -2993,8 +3018,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
   }
 
   let videos = [];
-  if (cfg.videosEnabled !== false && searchOn && wantsVideos(message) && (isAdmin || canSearch(u, cfg, perms))) {
-    videos = await findYouTubeVideos(env, cfg, message, 5);
+  if (cfg.videosEnabled !== false && searchOn && wantsVideos(userText) && (isAdmin || canSearch(u, cfg, perms))) {
+    videos = await findYouTubeVideos(env, cfg, cleanSearchQuery(userText), 5);
     if (videos.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
       u.lastTool = { name: "videos", at: nowMs() };
@@ -3007,7 +3032,7 @@ async function handleChat(env, cfg, uid, u, body, email) {
   let sysP = buildSystemPrompt(cfg, modeKey, arena, mode.provider === "gemini" ? "gemini" : (mode.provider === "deepseek" ? "deepseek" : "standard"), customPrompt)
     + "\n\nSCREEN ISOLATION LAW: This is the general chat. Never mention, invent, or discuss Marketplace business listings or News-screen articles here. Each screen of the app has its own separate context.";
   if (body.askRule && !isAckTurn) sysP += "\n\n" + String(body.askRule).slice(0, 900);
-  const autoDeep = cfg.autoDeepThink !== false && !mode.deep && body.deep !== true && !isAckTurn && needsDeepThink(message);
+  const autoDeep = cfg.autoDeepThink !== false && !mode.deep && body.deep !== true && !isAckTurn && needsDeepThink(userText);
   if (autoDeep) {
     sysP += "\n\nDEEP THINKING MODE (auto-activated - this question is complex): Slow down completely. Solve step by step, one step per line. State the method before using it. Verify every sign, unit, and formula as you go. Before presenting the final answer, re-check it against the original question. Never rush, never skip steps.";
   }
