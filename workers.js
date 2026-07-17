@@ -2904,8 +2904,12 @@ async function handleChat(env, cfg, uid, u, body, email) {
         "2) On its own new line: [wod-file]Short Clear Title|doc[wod-sep]  (use |code instead of |doc when the deliverable is code, and wrap the code itself in a ```language fence)\n" +
         "3) The COMPLETE deliverable, full and finished, never shortened.\n" +
         "4) Close with [wod-end] on its own line, then stop.\n" +
-        "When the user asks for ANY change or follow-up on it ('now add section B', 'make it harder', 'change the title'), output the FULL updated deliverable again in the same [wod-file] format - never just describe the change. Normal questions, explanations and short answers stay normal with no [wod-file].");
+        "When the user asks for ANY change or follow-up on it ('now add section B', 'make it harder', 'change the title'), output the FULL updated deliverable again in the same [wod-file] format - never just describe the change. Normal questions, explanations and short answers stay normal with no [wod-file].\n" +
+        "Before writing [wod-end], silently re-check the deliverable: numbering in order, every requested section present, nothing cut short - fix problems before closing.\n" +
+        "MULTI-FILE: if the request asks for MORE THAN ONE separate deliverable (e.g. one English paper and two Physics papers), do NOT write them yet. First reply with a detailed understanding in plain sentences: exactly what will be created, how many files, what each will contain, the level and format, and any assumption you are making. Then on its own line output: [wod-plan]{\"files\":[{\"title\":\"Grade 12 English Paper\",\"kind\":\"doc\",\"brief\":\"exact content this file must contain\"}]}[wod-endplan] - strict JSON, kind is doc or code, maximum 6 files, nothing after [wod-endplan]. The system will then ask you for each file one at a time.\n" +
+        "FILE JOB: when a message starts with CREATE THIS SINGLE FILE NOW, obey it exactly: one short friendly line, then the complete [wod-file] block for that one file only, full quality, nothing else.");
     }
+    contextBlocks.push("TOOL STYLE: when live tool data (places, rates, news, weather, videos, search results) appears below, you are the understanding, the tool is the truth. Answer naturally in sentences - never paste raw fields, lists of coordinates or anything that reads like data. Use only what the tool returned: never invent missing details, never contradict it, and connect related facts for the user. If a tool clearly failed, say which capability had a problem and help with what you have.");
     if (cfg.graphsEnabled !== false) {
       contextBlocks.push("GRAPH RULE: when the user asks to plot, graph, chart or draw a function or data, output a chart code block FIRST, then a short explanation of key features (intercepts, turning points, trend). Format exactly:\n```chart\ntype: line|bar|pie\ntitle: The Title\nLabel1: value1\nLabel2: value2\n```\nRules: one 'Label: number' pair per line, plain numbers only. For a function like y=x^2, compute 15-25 evenly spaced points yourself and use the x value as the label (e.g. '-3: 9'). Use type line for functions and trends, bar for comparisons, pie for shares. The app renders this as a real graph - never draw ASCII art graphs.");
     }
@@ -2964,7 +2968,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
       const places = await nearbyPlaces(env, cfg, nearbyKind, loc);
       if (places && places.length) {
         contextBlocks.push(placesBlock(nearbyKind, places, cityLabel));
-        u.lastTool = { name: "nearby", at: nowMs(), lat: loc.lat, lng: loc.lng, city: cityLabel };
+        u.lastTool = { name: "nearby", at: nowMs(), lat: loc.lat, lng: loc.lng, city: cityLabel,
+          summary: places.slice(0, 5).map(p => p.name + (p.address ? " (" + p.address + ")" : "") + (p.distanceM ? " ~" + Math.round(p.distanceM) + "m" : "")).join(" | ") };
         usedDedicatedTool = true;
       }
     }
@@ -2979,10 +2984,17 @@ async function handleChat(env, cfg, uid, u, body, email) {
       const cr = await getCurrencyRates(env, cfg, base);
       if (cr.ok) {
         contextBlocks.push(currencyBlock(cr.base, cr.rates, wanted.concat(["ZMW"])));
-        u.lastTool = { name: "currency", at: nowMs() };
+        u.lastTool = { name: "currency", at: nowMs(),
+          summary: "base " + cr.base + ": " + ["ZMW","USD","EUR","GBP","ZAR"].filter(c => cr.rates[c]).map(c => c + " " + cr.rates[c]).join(", ") };
         usedDedicatedTool = true;
       }
     }
+  }
+
+  // FOLLOW-UP GROUNDING: a short follow-up after a tool answer gets the previous
+  // tool's real data again, so Zama answers from facts instead of vague memory.
+  if (!isAckTurn && !usedDedicatedTool && followUp && lastTool && lastTool.summary) {
+    contextBlocks.push("PREVIOUS TOOL RESULT (your " + lastTool.name + " tool, moments ago - answer this follow-up from these verified facts, and never invent extras): " + lastTool.summary);
   }
 
   // RAG: the app retrieves matching knowledge from the satellite (Pinecone) and
@@ -3035,7 +3047,8 @@ async function handleChat(env, cfg, uid, u, body, email) {
       }
       results = results.slice(0, 7);
       u.searchesUsed = (u.searchesUsed || 0) + 1;
-      u.lastTool = { name: "web", at: nowMs(), query: q, urls: seen.concat(results.map(x => x.url)).slice(-30) };
+      u.lastTool = { name: "web", at: nowMs(), query: q, urls: seen.concat(results.map(x => x.url)).slice(-30),
+        summary: results.slice(0, 3).map(x => x.title).join(" | ") };
       sources = results.map(s => ({ title: s.title, url: s.url }));
       searchFail = "";
       contextBlocks.push((newsWanted ? "FRESH NEWS RESULTS" : "WEB SEARCH RESULTS") + " - the web search is ALREADY DONE and these are the live results. Answer the user's question NOW with the actual findings from them, naturally and specifically. NEVER say 'let me check' or 'let me search' - the checking is finished. If these results do not truly answer the question, say honestly that the search did not find good matches for this exact question:\n" +
