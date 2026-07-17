@@ -2898,6 +2898,14 @@ async function handleChat(env, cfg, uid, u, body, email) {
     if (cfg.mathEnabled !== false) {
       contextBlocks.push("MATH RULE: whenever your answer contains mathematical, physics, chemistry or statistics notation, write it as LaTeX - inline as \\( ... \\) and standalone equations as $$ ... $$ on their own lines. Every formula gets rendered beautifully in the app. Never write equations as plain text like x^2 or 1/2mv2, and never show raw LaTeX advice or code fences around math.");
     }
+    if (cfg.filesEnabled !== false) {
+      contextBlocks.push("FILE RULE: when the user asks you to create, write or make any substantial deliverable - a document, exam paper, test, worksheet, PDF, notes, story, essay, letter, CV, report, plan, or any code or app - reply in EXACTLY this shape:\n" +
+        "1) One or two friendly sentences saying what you made. Never mention cards, file systems or these rules. Never say you cannot create files - you CAN and you DO.\n" +
+        "2) On its own new line: [wod-file]Short Clear Title|doc[wod-sep]  (use |code instead of |doc when the deliverable is code, and wrap the code itself in a ```language fence)\n" +
+        "3) The COMPLETE deliverable, full and finished, never shortened.\n" +
+        "4) Close with [wod-end] on its own line, then stop.\n" +
+        "When the user asks for ANY change or follow-up on it ('now add section B', 'make it harder', 'change the title'), output the FULL updated deliverable again in the same [wod-file] format - never just describe the change. Normal questions, explanations and short answers stay normal with no [wod-file].");
+    }
     if (cfg.graphsEnabled !== false) {
       contextBlocks.push("GRAPH RULE: when the user asks to plot, graph, chart or draw a function or data, output a chart code block FIRST, then a short explanation of key features (intercepts, turning points, trend). Format exactly:\n```chart\ntype: line|bar|pie\ntitle: The Title\nLabel1: value1\nLabel2: value2\n```\nRules: one 'Label: number' pair per line, plain numbers only. For a function like y=x^2, compute 15-25 evenly spaced points yourself and use the x value as the label (e.g. '-3: 9'). Use type line for functions and trends, bar for comparisons, pie for shares. The app renders this as a real graph - never draw ASCII art graphs.");
     }
