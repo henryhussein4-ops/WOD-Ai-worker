@@ -125,6 +125,10 @@ const DEFAULT_CONFIG = {
   researchSourcesPaid: 90,
   videosEnabled: true,
   videoFreePerDay: 1,
+  videoSource: "pexels",          // pexels (your key) or youtube (web search)
+  videoFeedDailyLimit: 10,        // fresh Pexels pulls per day for the Videos screen
+  videoCacheMinutes: 1440,        // cache a topic's videos 24h so they never disappear
+  videoCountry: "",               // optional Pexels locale hint (blank = default)
   cartesiaEnabled: true,
   cartesiaModel: "sonic-2",
   cartesiaVoice: "694f9389-aac1-45b6-b726-9d9369183238",
@@ -147,6 +151,10 @@ const DEFAULT_CONFIG = {
 
   generalSearchWorker: "https://withered-cake-aa88.zeemar256.workers.dev/",
   newsSearchWorker: "https://curly-band-5b64.imzeeworld.workers.dev/",
+  newsDirect: true,              // call NewsData.io directly with your key
+  newsDirectFirst: true,         // try NewsData.io before the external worker
+  newsCountry: "zm",             // NewsData country code (zm = Zambia); blank = worldwide
+  newsLanguage: "en",            // NewsData language filter
   newsHourlyLimit: 20,
   newsCacheMinutes: 60,
   marketEnabled: true,
@@ -1201,6 +1209,41 @@ async function newsFeedAllowance(env, cfg, commit) {
   return { allowed: true };
 }
 
+// Calls NewsData.io DIRECTLY with your key (Panel: newsDataKey). This removes
+// the dependency on the separate external news worker. Returns normalized
+// {ok, results:[{title,url,snippet}]}. Never throws.
+async function fetchNewsDataDirect(env, cfg, query, count) {
+  const key = await singleKey(env, "newsDataKey", ["NEWSDATA_KEY", "NEWSDATA_API_KEY"]);
+  if (!key) return { ok: false, noKey: true, results: [] };
+  const params = ["apikey=" + encodeURIComponent(key)];
+  const q = String(query || "").trim();
+  if (q) params.push("q=" + encodeURIComponent(q.slice(0, 100)));
+  if (cfg.newsLanguage) params.push("language=" + encodeURIComponent(cfg.newsLanguage));
+  if (cfg.newsCountry) params.push("country=" + encodeURIComponent(cfg.newsCountry));
+  const url = "https://newsdata.io/api/1/latest?" + params.join("&");
+  let res = await fetchWithTimeout(url, {}, 15000);
+  // Some plans/queries reject the country+language combo; retry with just q.
+  if (res && !res.ok && (cfg.newsCountry || cfg.newsLanguage)) {
+    const alt = "https://newsdata.io/api/1/latest?apikey=" + encodeURIComponent(key) + (q ? "&q=" + encodeURIComponent(q.slice(0, 100)) : "");
+    res = await fetchWithTimeout(alt, {}, 15000);
+  }
+  if (!res || !res.ok) return { ok: false, http: res ? res.status : 0, results: [] };
+  try {
+    const d = await res.json();
+    if (d.status && d.status !== "success") return { ok: false, apiError: d.results && d.results.message ? d.results.message : d.message || "newsdata error", results: [] };
+    const arr = Array.isArray(d.results) ? d.results : [];
+    const results = arr.slice(0, Math.min(count || 10, 20)).map(r => ({
+      title: r.title || "",
+      url: r.link || r.source_url || "",
+      snippet: String(r.description || r.content || "").slice(0, 900),
+      image: r.image_url || "",
+      source: r.source_id || r.source_name || "",
+      date: r.pubDate || ""
+    })).filter(r => r.title);
+    return { ok: results.length > 0, results, fresh: true };
+  } catch (e) { return { ok: false, results: [] }; }
+}
+
 async function searchNewsWorker(env, cfg, query, count, opts) {
   const key = "newsCache/" + safeKey(query.toLowerCase().slice(0, 80));
   let stale = null;
@@ -1217,21 +1260,56 @@ async function searchNewsWorker(env, cfg, query, count, opts) {
     return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
   }
   const allow = await newsAllowance(env, cfg, 1);
-  if (!allow.allowed) return { ok: false, limited: true, results: [] };
+  if (!allow.allowed) {
+    if (stale) return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+    return { ok: false, limited: true, results: [] };
+  }
+
+  // 1) DIRECT NewsData.io with your key (preferred).
+  let direct = null;
+  if (cfg.newsDirect !== false) {
+    direct = await fetchNewsDataDirect(env, cfg, query, count);
+    if (direct.ok && direct.results.length) {
+      await fbSet(env, key, { results: direct.results, fetchedAt: nowMs() });
+      return { ok: true, results: direct.results, fresh: true, via: "newsdata" };
+    }
+  }
+
+  // 2) Fall back to the external news worker (if still configured).
   const base = cfg.newsSearchWorker;
-  if (!base) return { ok: false, results: [] };
-  const res = await fetchWithTimeout(base + (base.indexOf("?") === -1 ? "?q=" : "&q=") + encodeURIComponent(query), {}, 20000);
-  if (!res || !res.ok) return { ok: false, results: [] };
+  if (base) {
+    const res = await fetchWithTimeout(base + (base.indexOf("?") === -1 ? "?q=" : "&q=") + encodeURIComponent(query), {}, 20000);
+    if (res && res.ok) {
+      try {
+        const d = await res.json();
+        const arr = d.sources || d.articles || d.results || [];
+        const results = arr.slice(0, Math.min(count || 10, 20)).map(r => ({
+          title: r.title || "", url: r.url || r.link || "",
+          snippet: String(r.text || r.snippet || r.content || r.description || "").slice(0, 900)
+        })).filter(r => r.title);
+        if (results.length) { await fbSet(env, key, { results, fetchedAt: nowMs() }); return { ok: true, results, fresh: true, via: "worker" }; }
+      } catch (e) {}
+    }
+  }
+
+  // 3) KEYLESS fallback: Google News RSS (needs no key, always available).
+  // This is the "news that needs no key" - Zambia-focused when country is zm.
   try {
-    const d = await res.json();
-    const arr = d.sources || d.articles || d.results || [];
-    const results = arr.slice(0, Math.min(count || 10, 20)).map(r => ({
-      title: r.title || "", url: r.url || r.link || "",
-      snippet: String(r.text || r.snippet || r.content || r.description || "").slice(0, 900)
-    }));
-    if (results.length) await fbSet(env, key, { results, fetchedAt: nowMs() });
-    return { ok: results.length > 0, results, fresh: true };
-  } catch (e) { return { ok: false, results: [] }; }
+    const rssQ = (cfg.newsCountry === "zm" && !/zambia/i.test(query)) ? (query + " Zambia") : query;
+    const rss = await searchGoogleNewsRss(rssQ, Math.min(count || 10, 20));
+    if (rss && rss.length) {
+      const results = rss.map(r => ({
+        title: r.title || "", url: r.url || "",
+        snippet: String(r.snippet || "").slice(0, 900),
+        image: "", source: r.source || "", date: ""
+      })).filter(r => r.title);
+      if (results.length) { await fbSet(env, key, { results, fetchedAt: nowMs() }); return { ok: true, results, fresh: true, via: "rss" }; }
+    }
+  } catch (e) {}
+
+  // 4) Nothing fresh - serve stale cache if we have any.
+  if (stale) return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+  return { ok: false, results: [], directErr: direct && direct.noKey ? "no NewsData key saved" : (direct && direct.apiError) || null };
 }
 
 async function searchWeb(env, cfg, query, count) {
@@ -3263,11 +3341,15 @@ async function handleChat(env, cfg, uid, u, body, email) {
 
   let videos = [];
   if (cfg.videosEnabled !== false && searchOn && wantsVideos(userText) && (isAdmin || canSearch(u, cfg, perms))) {
-    videos = await findYouTubeVideos(env, cfg, cleanSearchQuery(userText), 5);
+    // Use the SAME cached feed the Videos screen uses (Pexels with your key),
+    // so asking Zama for videos in chat pulls real videos too.
+    const vr = await searchVideoFeed(env, cfg, cleanSearchQuery(userText), 6, { staleOk: true });
+    videos = (vr && vr.ok) ? vr.results.slice(0, 6) : [];
     if (videos.length) {
       u.searchesUsed = (u.searchesUsed || 0) + 1;
       u.lastTool = { name: "videos", at: nowMs() };
-      contextBlocks.push("The app will show these YouTube videos as tappable cards under your reply. Mention them naturally and briefly, do not paste links:\n" + videos.map((v, i) => (i + 1) + ". " + v.title).join("\n"));
+      activity.push({ t: "videos", count: videos.length });
+      contextBlocks.push("The app will show these videos as tappable cards under your reply. Mention them naturally and briefly, do not paste links:\n" + videos.map((v, i) => (i + 1) + ". " + v.title).join("\n"));
     }
   }
 
@@ -3838,11 +3920,215 @@ async function handleNewsFeed(env, cfg, uid, u, body) {
     return json(friendly("Fresh news is taking a short break. Please check again soon."), 429);
   }
   if (!r.ok || !r.results.length) {
-    return json(friendly("News is temporarily unavailable. Please try again shortly."), 502);
+    const why = r.directErr === "no NewsData key saved"
+      ? "News isn't set up yet - add your NewsData key in the Panel."
+      : "News is temporarily unavailable. Please try again shortly.";
+    return json(friendly(why), 502);
   }
   u.searchesUsed = (u.searchesUsed || 0) + 1;
   await saveUser(env, uid, u);
   return json({ ok: true, topic, cached: !!r.cached, articles: r.results });
+}
+
+// ===== VIDEOS (Pexels, your key) =====
+// Daily allowance so the Videos screen pulls e.g. 10 fresh topics a day.
+async function videoFeedAllowance(env, cfg, commit) {
+  let meta = null;
+  try { meta = await fbGet(env, "videoFeedMeta"); } catch (e) {}
+  const day = new Date().toISOString().slice(0, 10);
+  if (!meta || meta.day !== day) meta = { day, pulls: 0 };
+  const limit = cfg.videoFeedDailyLimit === undefined ? 10 : cfg.videoFeedDailyLimit;
+  if (!isUnlimited(limit) && (meta.pulls || 0) >= limit) return { allowed: false, used: meta.pulls || 0, limit };
+  if (commit) {
+    meta.pulls = (meta.pulls || 0) + 1;
+    try { await fbSet(env, "videoFeedMeta", meta); } catch (e) {}
+  }
+  return { allowed: true, used: meta.pulls || 0, limit };
+}
+
+// Calls Pexels Video API directly with your key (Panel: pexelsKey).
+async function fetchPexelsVideos(env, cfg, query, count) {
+  const key = await singleKey(env, "pexelsKey", ["PEXELS_KEY", "PEXELS_API_KEY"]);
+  if (!key) return { ok: false, noKey: true, results: [] };
+  const per = Math.min(Math.max(count || 12, 1), 30);
+  const url = "https://api.pexels.com/videos/search?per_page=" + per +
+    "&query=" + encodeURIComponent(String(query || "Zambia").slice(0, 100)) +
+    (cfg.videoCountry ? "&locale=" + encodeURIComponent(cfg.videoCountry) : "");
+  const res = await fetchWithTimeout(url, { headers: { "Authorization": key } }, 15000);
+  if (!res || !res.ok) return { ok: false, http: res ? res.status : 0, results: [] };
+  try {
+    const d = await res.json();
+    const arr = Array.isArray(d.videos) ? d.videos : [];
+    const results = arr.map(v => {
+      // Pick a mobile-friendly mp4 file (prefer HD but not huge).
+      let files = Array.isArray(v.video_files) ? v.video_files.slice() : [];
+      files.sort((a, b) => (a.height || 0) - (b.height || 0));
+      const pick = files.find(f => (f.height || 0) >= 540) || files[files.length - 1] || files[0];
+      const pics = Array.isArray(v.video_pictures) && v.video_pictures.length ? v.video_pictures[0].picture : (v.image || "");
+      return {
+        id: v.id,
+        title: (v.user && v.user.name) ? (v.user.name + " on Pexels") : "Pexels video",
+        url: v.url || "",
+        file: pick ? pick.link : "",
+        thumb: v.image || pics || "",
+        width: pick ? pick.width : (v.width || 0),
+        height: pick ? pick.height : (v.height || 0),
+        duration: v.duration || 0,
+        author: v.user ? v.user.name : "",
+        authorUrl: v.user ? v.user.url : ""
+      };
+    }).filter(v => v.file);
+    return { ok: results.length > 0, results, fresh: true };
+  } catch (e) { return { ok: false, results: [] }; }
+}
+
+// Cached, daily-limited video search - videos never disappear (24h cache,
+// and stale cache is always served when the daily fresh limit is reached).
+async function searchVideoFeed(env, cfg, query, count, opts) {
+  const cacheKey = "videoCache/" + safeKey(String(query).toLowerCase().slice(0, 80));
+  let stale = null;
+  try {
+    const cached = await fbGet(env, cacheKey);
+    if (cached && cached.results && cached.results.length) {
+      if (cached.fetchedAt && nowMs() - cached.fetchedAt < (cfg.videoCacheMinutes || 1440) * 60000) {
+        return { ok: true, results: cached.results.slice(0, count), cached: true };
+      }
+      stale = cached.results;
+    }
+  } catch (e) {}
+  if (opts && opts.staleOk && stale) return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+
+  const daily = await videoFeedAllowance(env, cfg, false);
+  if (!daily.allowed) {
+    if (stale) return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+    return { ok: false, limited: true, results: [], used: daily.used, limit: daily.limit };
+  }
+
+  if (cfg.videoSource !== "youtube") {
+    const px = await fetchPexelsVideos(env, cfg, query, Math.max(count || 12, 12));
+    if (px.ok && px.results.length) {
+      await videoFeedAllowance(env, cfg, true);
+      await fbSet(env, cacheKey, { results: px.results, fetchedAt: nowMs() });
+      return { ok: true, results: px.results, fresh: true, via: "pexels" };
+    }
+    if (px.noKey) return { ok: false, noKey: true, results: [] };
+  }
+
+  // Fallback: YouTube via web search (uses existing finder).
+  const yt = await findYouTubeVideos(env, cfg, query, count || 12);
+  if (yt && yt.length) {
+    await videoFeedAllowance(env, cfg, true);
+    await fbSet(env, cacheKey, { results: yt, fetchedAt: nowMs() });
+    return { ok: true, results: yt, fresh: true, via: "youtube" };
+  }
+  if (stale) return { ok: true, results: stale.slice(0, count), cached: true, stale: true };
+  return { ok: false, results: [] };
+}
+
+async function handleVideoFeed(env, cfg, uid, u, body) {
+  if (cfg.videosEnabled === false) return json(friendly("Videos are switched off right now."), 403);
+  const topic = String(body.topic || body.query || "Zambia").slice(0, 100);
+  const perms = u.plan === "paid" ? cfg.paidPerms : cfg.freePerms;
+  if (!canSearch(u, cfg, perms) && uid !== ADMIN_UID) {
+    return json(friendly("Videos are resting for now. They will be back after your usage reset."), 403);
+  }
+  const daily = await videoFeedAllowance(env, cfg, false);
+  const r = await searchVideoFeed(env, cfg, topic, 15, { staleOk: !daily.allowed });
+  if (!daily.allowed && (!r.results || !r.results.length)) {
+    return json(friendly("Today's fresh video pulls are done. Saved videos still play, and fresh videos return tomorrow."), 429);
+  }
+  if (r.limited && (!r.results || !r.results.length)) {
+    return json(friendly("Fresh videos are taking a short break. Saved videos still play."), 429);
+  }
+  if (!r.ok || !r.results.length) {
+    const why = r.noKey ? "Videos aren't set up yet - add your Pexels key in the Panel." : "Videos are temporarily unavailable. Please try again shortly.";
+    return json(friendly(why), 502);
+  }
+  u.searchesUsed = (u.searchesUsed || 0) + 1;
+  await saveUser(env, uid, u);
+  return json({ ok: true, topic, cached: !!r.cached, videos: r.results });
+}
+
+// ===== LOCATION (Mapbox forward geocode + satellite image) =====
+// Resolves ANY place name (not just cities) to coordinates and a rich place
+// record, plus a Mapbox satellite static image URL (real satellite view).
+async function mapboxGeocodePlace(env, query, near) {
+  const key = await singleKey(env, "mapboxKey", ["MAPBOX_KEY", "MAPBOX_TOKEN"]);
+  if (!key || !query) return { noKey: !key };
+  let url = "https://api.mapbox.com/geocoding/v5/mapbox.places/" + encodeURIComponent(String(query).slice(0, 120)) +
+    ".json?limit=1&access_token=" + key;
+  if (near && near.lat) url += "&proximity=" + near.lng + "," + near.lat;
+  const res = await fetchWithTimeout(url, {}, 12000);
+  if (!res || !res.ok) return { http: res ? res.status : 0 };
+  try {
+    const d = await res.json();
+    const f = d.features && d.features[0];
+    if (!f) return { none: true };
+    const ctx = {};
+    (f.context || []).forEach(c => { const id = (c.id || "").split(".")[0]; if (id) ctx[id] = c.text; });
+    return {
+      name: f.text || query,
+      fullName: f.place_name || f.text || query,
+      lat: f.center ? f.center[1] : null,
+      lng: f.center ? f.center[0] : null,
+      category: (f.properties && f.properties.category) || (f.place_type && f.place_type[0]) || "",
+      address: f.properties && f.properties.address ? f.properties.address : "",
+      region: ctx.region || "", country: ctx.country || "", place: ctx.place || ""
+    };
+  } catch (e) { return {}; }
+}
+async function mapboxSatelliteImage(env, lat, lng, zoom) {
+  const key = await singleKey(env, "mapboxKey", ["MAPBOX_KEY", "MAPBOX_TOKEN"]);
+  if (!key || lat == null || lng == null) return "";
+  const z = zoom || 15;
+  // Satellite-streets static image with a marker at the place.
+  return "https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/static/pin-l+ef4444(" +
+    lng + "," + lat + ")/" + lng + "," + lat + "," + z + ",0/600x360@2x?access_token=" + key;
+}
+async function handleLocation(env, cfg, uid, u, body, email) {
+  const query = String(body.query || body.place || "").trim();
+  if (!query) return json(friendly("Which place should Zama look up?"), 400);
+  const isAdmin = uid === ADMIN_UID;
+  const perms = u.plan === "paid" ? cfg.paidPerms : cfg.freePerms;
+  if (!canSearch(u, cfg, perms) && !isAdmin) return json(friendly("Location search is resting until your usage reset."), 403);
+  const afford = maxAffordableChars(u, cfg, 1, isAdmin);
+  if (afford < (cfg.charsPerUnit || 500)) return json({ ok: false, limitHit: true, message: u.plan === "paid" ? cfg.paidLimitMessage : cfg.upgradeMessage }, 402);
+
+  const near = (body.lat && body.lng) ? { lat: Number(body.lat), lng: Number(body.lng) } : null;
+  const place = await mapboxGeocodePlace(env, query, near);
+  if (place && place.noKey) return json(friendly("Location lookup isn't set up yet - add your Mapbox key in the Panel."), 502);
+  if (!place || place.none || place.lat == null) {
+    return json(friendly("Zama couldn't pinpoint \"" + query + "\". Try adding the town or country."), 404);
+  }
+  const sat = await mapboxSatelliteImage(env, place.lat, place.lng, body.zoom || 15);
+
+  // Let Zama give a wide, detailed, honest answer about the place.
+  const facts = "PLACE (from Mapbox, real data):\n" +
+    "Name: " + place.fullName + "\n" +
+    (place.category ? "Type: " + place.category + "\n" : "") +
+    "Coordinates: " + place.lat.toFixed(5) + ", " + place.lng.toFixed(5) + "\n" +
+    (place.place ? "Town/City: " + place.place + "\n" : "") +
+    (place.region ? "Region: " + place.region + "\n" : "") +
+    (place.country ? "Country: " + place.country + "\n" : "");
+  const messages = [
+    { role: "system", content: buildSystemPrompt(cfg, "normal", "", "standard") + (await skillLawFor(env, cfg, "location place " + query)) +
+      "\n\nYou are describing a REAL place the user asked about. Use the Mapbox facts below as ground truth for name, type and location. Then give a wide, helpful, detailed description: what it is, where it sits (town, region, country), what it's near or known for, and anything practically useful. Be honest - if you are unsure about a detail, say so. Never invent phone numbers or exact addresses." },
+    { role: "user", content: "Tell me about this place in detail: " + query + "\n\n" + facts }
+  ];
+  let r = await callStandard(env, cfg, messages, providerMaxTokens(perms, afford));
+  if (r.ok && r.finish === "length") {
+    const cont = await autoContinue(env, cfg, (m, c) => callStandard(env, cfg, m, c), messages, r, providerMaxTokens(perms, afford), u, 1, isAdmin);
+    r = Object.assign({}, r, { text: cont.text });
+  }
+  const text = r.ok ? r.text : (place.fullName + "\n\nLocated at " + place.lat.toFixed(4) + ", " + place.lng.toFixed(4) + (place.country ? " in " + place.country : "") + ".");
+  const budget = await enforceBudget(env, cfg, uid, u, text, 1, null);
+  u.lastTool = { name: "location", at: nowMs(), lat: place.lat, lng: place.lng, query };
+  await saveUser(env, uid, u);
+  return json({
+    ok: true, text: budget.text, cut: budget.cut, message: budget.cut ? budget.cutMessage : null,
+    place: { name: place.name, fullName: place.fullName, lat: place.lat, lng: place.lng, category: place.category, region: place.region, country: place.country, place: place.place },
+    satellite: sat
+  });
 }
 
 async function handleContextAsk(env, cfg, uid, u, body) {
@@ -4055,6 +4341,31 @@ export default {
           const hp = (c) => { c = String(c || "").replace(/\s+/g, " ").trim(); return c.slice(0, Math.min(Math.ceil(c.length / 2), 120)); };
           return json({ ok: true, skills: all.map(sk => ({ name: sk.name, mandatory: !!sk.mandatory, half: hp(sk.content) })) });
         }
+        case "/news/test": {
+          // ADMIN diagnostic: shows exactly whether NewsData.io is reachable
+          // with your key, so you never have to guess why news is empty.
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const q = String(body.query || "Zambia").slice(0, 100);
+          const hasKey = !!(await singleKey(env, "newsDataKey", ["NEWSDATA_KEY", "NEWSDATA_API_KEY"]));
+          const direct = await fetchNewsDataDirect(env, cfg, q, 5);
+          const hourly = await (async () => { try { return await fbGet(env, "newsMeta"); } catch (e) { return null; } })();
+          const dailyFeed = await (async () => { try { return await fbGet(env, "newsFeedMeta"); } catch (e) { return null; } })();
+          return json({
+            ok: true,
+            newsDataKeySaved: hasKey,
+            directResult: { ok: direct.ok, count: direct.results.length, noKey: !!direct.noKey, http: direct.http || null, apiError: direct.apiError || null, sample: direct.results.slice(0, 3).map(r => r.title) },
+            externalWorker: cfg.newsSearchWorker || "(none)",
+            newsDirect: cfg.newsDirect !== false,
+            hourlyUsage: hourly, dailyFeedUsage: dailyFeed,
+            hourlyLimit: cfg.newsHourlyLimit || 20, dailyFeedLimit: cfg.newsFeedDailyLimit
+          });
+        }
+        case "/currency/test": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const hasKey = !!(await singleKey(env, "currencyKey", ["CURRENCY_KEY", "EXCHANGERATE_KEY"]));
+          const cr = await getCurrencyRates(env, cfg, String(body.base || "USD"));
+          return json({ ok: true, currencyKeySaved: hasKey, rates: cr.ok ? { ZMW: cr.rates.ZMW, USD: cr.rates.USD, EUR: cr.rates.EUR } : null, fetched: cr.ok });
+        }
         case "/continue": return await handleContinue(env, cfg, uid, u);
 
         case "/think/start": return await thinkStart(env, cfg, uid, u, body, email);
@@ -4249,6 +4560,8 @@ export default {
         case "/news/ask": return await handleContextAsk(env, cfg, uid, u, body);
         case "/context/ask": return await handleContextAsk(env, cfg, uid, u, body);
         case "/nearby": return await handleNearby(env, cfg, uid, u, body, email);
+        case "/videos/feed": return await handleVideoFeed(env, cfg, uid, u, body);
+        case "/location": return await handleLocation(env, cfg, uid, u, body, email);
 
         case "/market/like": {
           const id = safeKey(body.listingId || "");
