@@ -1223,28 +1223,63 @@ async function newsFeedAllowance(env, cfg, commit) {
   return { allowed: true };
 }
 
-// Calls NewsData.io DIRECTLY with your key (Panel: newsDataKey). This removes
-// the dependency on the separate external news worker. Returns normalized
-// {ok, results:[{title,url,snippet}]}. Never throws.
+// Reads EVERY NewsData.io key you saved (Panel "NewsData.io keys", one per line),
+// plus the legacy single key and any env keys. Deduped, order preserved.
+function newsKeyTail(k) { return String(k).slice(-6); }
+async function loadNewsKeys(env) {
+  const sec = await getSecrets(env);
+  let out = [];
+  out = out.concat(keysFrom(sec.newsDataKeys));         // new: many keys
+  if (sec.newsDataKey) out = out.concat(keysFrom(sec.newsDataKey)); // legacy single
+  out = out.concat(keysFrom(env.NEWSDATA_KEYS));
+  if (env.NEWSDATA_KEY) out.push(String(env.NEWSDATA_KEY).trim());
+  if (env.NEWSDATA_API_KEY) out.push(String(env.NEWSDATA_API_KEY).trim());
+  const seen = {}, keys = [];
+  for (const k of out) { const t = String(k).trim(); if (t && !seen[t]) { seen[t] = 1; keys.push(t); } }
+  return keys;
+}
+// Dead keys are remembered only for the current day (NewsData resets daily),
+// then automatically retried tomorrow.
+async function loadNewsDead(env) {
+  let meta = null;
+  try { meta = await fbGet(env, "newsKeyMeta"); } catch (e) {}
+  if (!meta || meta.day !== dayKey()) meta = { day: dayKey(), dead: {} };
+  if (!meta.dead) meta.dead = {};
+  return meta;
+}
+
+// Calls NewsData.io DIRECTLY, rotating through ALL your keys: it uses the first
+// working key, and when a key is out of daily credits it marks it dead for today
+// and moves to the next key. Returns normalized {ok, results:[...]}. Never throws.
 async function fetchNewsDataDirect(env, cfg, query, count) {
-  const key = await singleKey(env, "newsDataKey", ["NEWSDATA_KEY", "NEWSDATA_API_KEY"]);
-  if (!key) return { ok: false, noKey: true, results: [] };
-  const params = ["apikey=" + encodeURIComponent(key)];
+  const keys = await loadNewsKeys(env);
+  if (!keys.length) return { ok: false, noKey: true, results: [] };
+  const meta = await loadNewsDead(env);
   const q = String(query || "").trim();
-  if (q) params.push("q=" + encodeURIComponent(q.slice(0, 100)));
-  if (cfg.newsLanguage) params.push("language=" + encodeURIComponent(cfg.newsLanguage));
-  if (cfg.newsCountry) params.push("country=" + encodeURIComponent(cfg.newsCountry));
-  const url = "https://newsdata.io/api/1/latest?" + params.join("&");
-  let res = await fetchWithTimeout(url, {}, 15000);
-  // Some plans/queries reject the country+language combo; retry with just q.
-  if (res && !res.ok && (cfg.newsCountry || cfg.newsLanguage)) {
-    const alt = "https://newsdata.io/api/1/latest?apikey=" + encodeURIComponent(key) + (q ? "&q=" + encodeURIComponent(q.slice(0, 100)) : "");
-    res = await fetchWithTimeout(alt, {}, 15000);
-  }
-  if (!res || !res.ok) return { ok: false, http: res ? res.status : 0, results: [] };
-  try {
-    const d = await res.json();
-    if (d.status && d.status !== "success") return { ok: false, apiError: d.results && d.results.message ? d.results.message : d.message || "newsdata error", results: [] };
+  const live = keys.filter(k => !meta.dead[newsKeyTail(k)]);
+  const dead = keys.filter(k => meta.dead[newsKeyTail(k)]);
+  const order = live.concat(dead);   // fresh keys first, exhausted ones retried last
+  let lastErr = null, changed = false;
+
+  for (const key of order) {
+    const params = ["apikey=" + encodeURIComponent(key)];
+    if (q) params.push("q=" + encodeURIComponent(q.slice(0, 100)));
+    if (cfg.newsLanguage) params.push("language=" + encodeURIComponent(cfg.newsLanguage));
+    if (cfg.newsCountry) params.push("country=" + encodeURIComponent(cfg.newsCountry));
+    let res = await fetchWithTimeout("https://newsdata.io/api/1/latest?" + params.join("&"), {}, 15000);
+    if (res && !res.ok && (cfg.newsCountry || cfg.newsLanguage)) {
+      const alt = "https://newsdata.io/api/1/latest?apikey=" + encodeURIComponent(key) + (q ? "&q=" + encodeURIComponent(q.slice(0, 100)) : "");
+      res = await fetchWithTimeout(alt, {}, 15000);
+    }
+    if (res && res.status === 429) { meta.dead[newsKeyTail(key)] = 1; changed = true; lastErr = "rate limit"; continue; }
+    if (!res || !res.ok) { lastErr = res ? ("http " + res.status) : "no response"; continue; }
+    let d; try { d = await res.json(); } catch (e) { lastErr = "bad response"; continue; }
+    if (d.status && d.status !== "success") {
+      const msg = (d.results && d.results.message) ? d.results.message : (d.message || "newsdata error");
+      const code = (d.results && d.results.code) ? String(d.results.code) : "";
+      if (/limit|quota|credit|exhaust|too ?many|429|upgrade/i.test(msg + " " + code)) { meta.dead[newsKeyTail(key)] = 1; changed = true; lastErr = msg; continue; }
+      lastErr = msg; continue;   // other error (bad param etc.) — try the next key too
+    }
     const arr = Array.isArray(d.results) ? d.results : [];
     const results = arr.slice(0, Math.min(count || 10, 20)).map(r => ({
       title: r.title || "",
@@ -1254,8 +1289,12 @@ async function fetchNewsDataDirect(env, cfg, query, count) {
       source: r.source_id || r.source_name || "",
       date: r.pubDate || ""
     })).filter(r => r.title);
-    return { ok: results.length > 0, results, fresh: true };
-  } catch (e) { return { ok: false, results: [] }; }
+    if (changed) { try { await fbSet(env, "newsKeyMeta", meta); } catch (e) {} }
+    if (results.length) return { ok: true, results, fresh: true, keyUsed: newsKeyTail(key), keysTotal: keys.length };
+    lastErr = lastErr || "no results";
+  }
+  if (changed) { try { await fbSet(env, "newsKeyMeta", meta); } catch (e) {} }
+  return { ok: false, apiError: lastErr, exhausted: true, keysTotal: keys.length, results: [] };
 }
 
 async function searchNewsWorker(env, cfg, query, count, opts) {
@@ -3947,7 +3986,7 @@ async function handleNewsFeed(env, cfg, uid, u, body) {
   }
   if (!r.ok || !r.results.length) {
     const why = r.directErr === "no NewsData key saved"
-      ? "News isn't set up yet - add your NewsData key in the Panel."
+      ? "News isn't set up yet - add your NewsData.io keys in the Panel."
       : "News is temporarily unavailable. Please try again shortly.";
     return json(friendly(why), 502);
   }
@@ -4714,14 +4753,19 @@ export default {
           // with your key, so you never have to guess why news is empty.
           if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
           const q = String(body.query || "Zambia").slice(0, 100);
-          const hasKey = !!(await singleKey(env, "newsDataKey", ["NEWSDATA_KEY", "NEWSDATA_API_KEY"]));
+          const allNewsKeys = await loadNewsKeys(env);
+          const newsDeadMeta = await loadNewsDead(env);
+          const deadCount = allNewsKeys.filter(k => newsDeadMeta.dead[newsKeyTail(k)]).length;
           const direct = await fetchNewsDataDirect(env, cfg, q, 5);
           const hourly = await (async () => { try { return await fbGet(env, "newsMeta"); } catch (e) { return null; } })();
           const dailyFeed = await (async () => { try { return await fbGet(env, "newsFeedMeta"); } catch (e) { return null; } })();
           return json({
             ok: true,
-            newsDataKeySaved: hasKey,
-            directResult: { ok: direct.ok, count: direct.results.length, noKey: !!direct.noKey, http: direct.http || null, apiError: direct.apiError || null, sample: direct.results.slice(0, 3).map(r => r.title) },
+            newsKeysSaved: allNewsKeys.length,
+            newsKeysDeadToday: deadCount,
+            newsKeysLive: allNewsKeys.length - deadCount,
+            keyUsed: direct.keyUsed || null,
+            directResult: { ok: direct.ok, count: direct.results.length, noKey: !!direct.noKey, exhausted: !!direct.exhausted, apiError: direct.apiError || null, sample: direct.results.slice(0, 3).map(r => r.title) },
             externalWorker: cfg.newsSearchWorker || "(none)",
             newsDirect: cfg.newsDirect !== false,
             hourlyUsage: hourly, dailyFeedUsage: dailyFeed,
