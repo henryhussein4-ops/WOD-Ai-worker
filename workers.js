@@ -129,6 +129,17 @@ const DEFAULT_CONFIG = {
   videoFeedDailyLimit: 10,        // fresh Pexels pulls per day for the Videos screen
   videoCacheMinutes: 1440,        // cache a topic's videos 24h so they never disappear
   videoCountry: "",               // optional Pexels locale hint (blank = default)
+
+  // ==== USAGE METERS (Settings > Usage screen — every line comes from here) ====
+  usageWarnAt: 3,                 // when messages left <= this, show the warning
+  usageWarnMessage: "",           // blank = auto: "You're remaining with not more than N messages, until your reset."
+  imageDailyFree: 20, imageDailyPaid: 200,   // image line limit (per day)
+  fileDailyFree: 10,  fileDailyPaid: 100,    // saved-files line limit (per day)
+  // ==== FREE KEYLESS TOOL SCREENS ====
+  weatherEnabled: true,           // Open-Meteo — no key, free
+  booksEnabled: true,             // Open Library — no key, free
+  sportsEnabled: true,            // TheSportsDB — free
+  sportsApiKey: "3",              // "3" is TheSportsDB's free public key (works with no account)
   cartesiaEnabled: true,
   cartesiaModel: "sonic-2",
   cartesiaVoice: "694f9389-aac1-45b6-b726-9d9369183238",
@@ -534,6 +545,7 @@ async function loadUser(env, uid) {
       lastFreeReset: 0, lastPaidReset: 0,
       searchesUsed: 0, lastSearchReset: 0,
       heavyUsed: 0, jobUsed: 0,
+      imageDay: "", imagesToday: 0, fileDay: "", filesToday: 0,
       awdUsedBytes: 0, lastCleanup: 0, createdAt: nowMs()
     };
     await fbSet(env, `users/${uid}`, u);
@@ -571,6 +583,8 @@ async function saveUser(env, uid, u) {
     heavyUsed: u.heavyUsed || 0, jobUsed: u.jobUsed || 0,
     awdUsedBytes: u.awdUsedBytes || 0, lastCleanup: u.lastCleanup || 0,
     ttsDay: u.ttsDay || "", ttsToday: u.ttsToday || 0,
+    imageDay: u.imageDay || "", imagesToday: u.imagesToday || 0,
+    fileDay: u.fileDay || "", filesToday: u.filesToday || 0,
     arenaUse: u.arenaUse || {}, lastTool: u.lastTool || null
   });
 }
@@ -3649,8 +3663,14 @@ async function handleAwdSave(env, cfg, uid, u, body) {
   const quota = (u.plan === "paid" ? cfg.paidAwdMB : cfg.freeAwdMB) * 1024 * 1024;
   const size = new TextEncoder().encode(content).length;
   if ((u.awdUsedBytes || 0) + size > quota) return json({ error: "AWD storage full for your plan." }, 403);
+  const fCapA = u.plan === "paid" ? cfg.fileDailyPaid : cfg.fileDailyFree;
+  dailyToolCounter(u, "fileDay", "filesToday");
+  if (uid !== ADMIN_UID && !isUnlimited(fCapA) && (u.filesToday || 0) >= (fCapA || 0)) {
+    return json({ error: "You've saved all your files for today. It resets tomorrow" + (u.plan === "paid" ? "." : ", or upgrade for more.") }, 403);
+  }
   await fbSet(env, `awd/${uid}/${safeKey(name)}`, { name, content, size, savedAt: nowMs() });
   u.awdUsedBytes = (u.awdUsedBytes || 0) + size;
+  u.filesToday = (u.filesToday || 0) + 1;
   await saveUser(env, uid, u);
   return json({ ok: true, name, usedBytes: u.awdUsedBytes, quotaBytes: quota });
 }
@@ -3665,8 +3685,14 @@ async function handleAssetSave(env, cfg, uid, u, body) {
   const size = dataUri.length;
   const quota = (u.plan === "paid" ? cfg.paidAwdMB : cfg.freeAwdMB) * 1024 * 1024;
   if ((u.awdUsedBytes || 0) + size > quota) return json({ error: "AWD storage full for your plan." }, 403);
+  const fCapB = u.plan === "paid" ? cfg.fileDailyPaid : cfg.fileDailyFree;
+  dailyToolCounter(u, "fileDay", "filesToday");
+  if (uid !== ADMIN_UID && !isUnlimited(fCapB) && (u.filesToday || 0) >= (fCapB || 0)) {
+    return json({ error: "You've saved all your files for today. It resets tomorrow" + (u.plan === "paid" ? "." : ", or upgrade for more.") }, 403);
+  }
   await fbSet(env, `assets/${uid}/${safeKey(name)}`, { name, dataUri, size, savedAt: nowMs() });
   u.awdUsedBytes = (u.awdUsedBytes || 0) + size;
+  u.filesToday = (u.filesToday || 0) + 1;
   await saveUser(env, uid, u);
   return json({ ok: true, name, placeholder: "{{ASSET:" + name + "}}" });
 }
@@ -4292,6 +4318,7 @@ async function handleStats(env, cfg, uid, u) {
     freeResetInHours: hLeft(u.lastFreeReset, cfg.freeResetHours),
     paidResetInHours: isPaid ? hLeft(u.lastPaidReset, cfg.paidResetHours) : null,
     awdUsedBytes: u.awdUsedBytes || 0,
+    usageMeters: buildUsageMeters(u, cfg, isAdmin),
     warning: buildWarning(u, cfg, isAdmin),
     banner: cfg.banner || "",
     switches: {
@@ -4302,6 +4329,347 @@ async function handleStats(env, cfg, uid, u) {
       teamMode: !!cfg.teamModeEnabled, redirect: !!cfg.redirectEnabled
     }
   });
+}
+
+// ============================================================
+//  USAGE METERS  — one accurate line per limit you set in the Panel.
+//  Everything the Settings > Usage screen draws comes from here, live.
+// ============================================================
+function dayKey() { return new Date().toISOString().slice(0, 10); }
+function hoursLeft(last, win) {
+  const remaining = hoursToMs(win) - (nowMs() - (last || 0));
+  return Math.max(0, remaining / 3600000);
+}
+function hoursToMidnightUTC() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+  return (next.getTime() - now.getTime()) / 3600000;
+}
+function fmtReset(hoursFloat) {
+  const totalMin = Math.max(0, Math.round((hoursFloat || 0) * 60));
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  if (h && m) return h + " hr " + m + " min";
+  if (h) return h + " hr";
+  return m + " min";
+}
+// A single line for the Usage screen. percent (0..100) is exactly how wide
+// the app draws the bar. left is what the user has remaining.
+function meter(key, label, used, limit, resetHoursFloat, color) {
+  const unlimited = isUnlimited(limit) || limit === Infinity || limit === true;
+  const lim = unlimited ? 0 : Math.max(0, Number(limit) || 0);
+  const usd = Math.max(0, Math.round(Number(used) || 0));
+  const left = unlimited ? "unlimited" : Math.max(0, lim - usd);
+  const percent = unlimited ? 0 : (lim > 0 ? Math.min(100, Math.round((usd / lim) * 100)) : (usd > 0 ? 100 : 0));
+  const hasReset = resetHoursFloat != null && isFinite(resetHoursFloat);
+  return {
+    key, label,
+    used: usd,
+    limit: unlimited ? "unlimited" : lim,
+    left,
+    percent,
+    unlimited,
+    resetInHours: hasReset ? Math.ceil(resetHoursFloat) : null,
+    resetText: hasReset ? fmtReset(resetHoursFloat) : "",
+    color: color || "#4a90d9"
+  };
+}
+// Total token capacity you configured (used to work out "used vs remaining").
+function tokenCapacity(u, cfg, isAdmin) {
+  if (isAdmin) return { cap: 0, unlimited: true };
+  let cap = 0, unlimited = false;
+  if (u.plan === "paid") {
+    if (isUnlimited(cfg.paidTokens)) unlimited = true; else cap += (cfg.paidTokens || 0);
+    if (cfg.paidFallbackToFree) { if (isUnlimited(cfg.freeTokens)) unlimited = true; else cap += (cfg.freeTokens || 0); }
+  } else {
+    if (isUnlimited(cfg.freeTokens)) unlimited = true; else cap += (cfg.freeTokens || 0);
+  }
+  return { cap, unlimited };
+}
+// Roll a daily counter over at UTC midnight (images, files).
+function dailyToolCounter(u, dayField, countField) {
+  if (u[dayField] !== dayKey()) { u[dayField] = dayKey(); u[countField] = 0; }
+  return u[countField] || 0;
+}
+function buildUsageMeters(u, cfg, isAdmin) {
+  const isPaid = u.plan === "paid";
+  const av = availableTokens(u, cfg, isAdmin);
+  const perMsg = unitCost(cfg, 1);
+  const tc = tokenCapacity(u, cfg, isAdmin);
+
+  const tokLeft = av.unlimited ? Infinity : av.total;
+  const tokCap = tc.unlimited ? true : tc.cap;
+  const tokUsed = tc.unlimited ? 0 : Math.max(0, tc.cap - (isFinite(tokLeft) ? tokLeft : tc.cap));
+
+  const msgCap = tc.unlimited ? true : Math.floor(tc.cap / perMsg);
+  const msgLeft = av.unlimited ? Infinity : Math.floor(tokLeft / perMsg);
+  const msgUsed = tc.unlimited ? 0 : Math.max(0, (msgCap === true ? 0 : msgCap) - (isFinite(msgLeft) ? msgLeft : 0));
+
+  const tokWin = isPaid ? (cfg.paidResetHours || 4) : (cfg.freeResetHours || 24);
+  const tokLast = isPaid ? (u.lastPaidReset || u.lastFreeReset || 0) : (u.lastFreeReset || 0);
+  const tokReset = hoursLeft(tokLast, tokWin);
+
+  let searchCap = isPaid ? cfg.paidWebSearchLimit : cfg.freeWebSearchLimit;
+  const searchReset = hoursLeft(u.lastSearchReset || 0, cfg.freeResetHours || 24);
+  let imgCap = isPaid ? cfg.imageDailyPaid : cfg.imageDailyFree;
+  let fileCap = isPaid ? cfg.fileDailyPaid : cfg.fileDailyFree;
+  let ttsCap = isPaid ? cfg.ttsDailyPaid : cfg.ttsDailyFree;
+  let storageCap = isPaid ? cfg.paidAwdMB : cfg.freeAwdMB;
+
+  const imgUsed = (u.imageDay === dayKey()) ? (u.imagesToday || 0) : 0;
+  const fileUsed = (u.fileDay === dayKey()) ? (u.filesToday || 0) : 0;
+  const ttsUsed = (u.ttsDay === dayKey()) ? (u.ttsToday || 0) : 0;
+  const midnight = hoursToMidnightUTC();
+  const storageMB = Math.round(((u.awdUsedBytes || 0) / (1024 * 1024)) * 10) / 10;
+
+  // Admin has no caps — show every line as unlimited.
+  if (isAdmin) { searchCap = true; imgCap = true; fileCap = true; ttsCap = true; storageCap = true; }
+
+  return [
+    meter("messages", "Messages", msgUsed, isAdmin ? true : msgCap, tokReset, "#4a90d9"),
+    meter("tokens", "Tokens this window", tokUsed, isAdmin ? true : tokCap, tokReset, "#3f7fd6"),
+    meter("searches", "Web searches", u.searchesUsed || 0, searchCap, searchReset, "#e2b13c"),
+    meter("images", "Images today", imgUsed, imgCap, midnight, "#c07cff"),
+    meter("files", "Files saved today", fileUsed, fileCap, midnight, "#4bd0a0"),
+    meter("voice", "Voice replies today", ttsUsed, ttsCap, midnight, "#ff9a5a"),
+    meter("storage", "File storage (MB)", storageMB, storageCap, null, "#7a8aa0")
+  ];
+}
+async function handleUsage(env, cfg, uid, u) {
+  const isAdmin = uid === ADMIN_UID;
+  const meters = buildUsageMeters(u, cfg, isAdmin);
+  const msgMeter = meters.find(m => m.key === "messages");
+  const warnAt = (cfg.usageWarnAt == null ? 3 : cfg.usageWarnAt);
+  let warning = null;
+  if (msgMeter && !msgMeter.unlimited && typeof msgMeter.left === "number" && msgMeter.left <= warnAt) {
+    warning = (cfg.usageWarnMessage && String(cfg.usageWarnMessage).trim())
+      ? String(cfg.usageWarnMessage).trim()
+      : ("You're remaining with not more than " + warnAt + " message" + (warnAt === 1 ? "" : "s") + ", until your reset.");
+  }
+  const session = meters.find(m => m.key === "messages");
+  return json({
+    ok: true,
+    plan: u.plan,
+    meters,
+    warning,
+    banner: cfg.banner || "",
+    sessionResetText: session ? session.resetText : ""
+  });
+}
+
+// ============================================================
+//  FREE KEYLESS TOOLS  — Weather, Books, Sports (no keys, no cost)
+//  plus Currency convert (keyless) and the on-screen AI answerer.
+// ============================================================
+
+// ---- WEATHER: Open-Meteo (geocoding + forecast), no API key ----
+async function geocodeCity(name) {
+  const url = "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=" + encodeURIComponent(String(name).slice(0, 80));
+  const res = await fetchWithTimeout(url, {}, 12000);
+  if (!res || !res.ok) return null;
+  try {
+    const d = await res.json();
+    const r = d.results && d.results[0];
+    if (!r) return null;
+    return { name: r.name, country: r.country || "", admin: r.admin1 || "", lat: r.latitude, lng: r.longitude };
+  } catch (e) { return null; }
+}
+function wxText(code) {
+  const c = Number(code);
+  if (c === 0) return "Clear sky";
+  if (c === 1) return "Mostly clear";
+  if (c === 2) return "Partly cloudy";
+  if (c === 3) return "Overcast";
+  if (c === 45 || c === 48) return "Fog";
+  if (c >= 51 && c <= 57) return "Drizzle";
+  if (c >= 61 && c <= 67) return "Rain";
+  if (c >= 71 && c <= 77) return "Snow";
+  if (c >= 80 && c <= 82) return "Rain showers";
+  if (c === 85 || c === 86) return "Snow showers";
+  if (c === 95) return "Thunderstorm";
+  if (c === 96 || c === 99) return "Thunderstorm with hail";
+  return "—";
+}
+async function getWeather(env, cfg, city, coords) {
+  let place = (coords && coords.lat != null) ? { name: coords.name || city || "Your location", country: "", admin: "", lat: coords.lat, lng: coords.lng } : null;
+  if (!place) {
+    if (!city) return { ok: false, need: "city" };
+    place = await geocodeCity(city);
+    if (!place) return { ok: false, notfound: true };
+  }
+  const url = "https://api.open-meteo.com/v1/forecast?latitude=" + place.lat + "&longitude=" + place.lng +
+    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m" +
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max" +
+    "&forecast_days=5&timezone=auto";
+  const res = await fetchWithTimeout(url, {}, 15000);
+  if (!res || !res.ok) return { ok: false };
+  let d; try { d = await res.json(); } catch (e) { return { ok: false }; }
+  const cur = d.current || {}, daily = d.daily || {}, t = daily.time || [], days = [];
+  for (let i = 0; i < t.length; i++) {
+    const code = daily.weather_code ? daily.weather_code[i] : null;
+    days.push({
+      date: t[i], code, text: wxText(code),
+      max: daily.temperature_2m_max ? daily.temperature_2m_max[i] : null,
+      min: daily.temperature_2m_min ? daily.temperature_2m_min[i] : null,
+      rain: daily.precipitation_probability_max ? daily.precipitation_probability_max[i] : null
+    });
+  }
+  return {
+    ok: true, place,
+    current: {
+      temp: cur.temperature_2m, feels: cur.apparent_temperature,
+      humidity: cur.relative_humidity_2m, wind: cur.wind_speed_10m,
+      rain: cur.precipitation, code: cur.weather_code, text: wxText(cur.weather_code)
+    },
+    days
+  };
+}
+
+// ---- BOOKS: Open Library search, no API key ----
+async function searchBooks(env, query, n) {
+  const count = Math.min(Math.max(n || 12, 1), 20);
+  const url = "https://openlibrary.org/search.json?limit=" + count +
+    "&fields=title,author_name,first_publish_year,cover_i,key,edition_count,subject" +
+    "&q=" + encodeURIComponent(String(query).slice(0, 120));
+  const res = await fetchWithTimeout(url, { headers: { "User-Agent": "WOD-Zama/1.0 (World Of Discoveries)" } }, 15000);
+  if (!res || !res.ok) return { ok: false };
+  try {
+    const d = await res.json();
+    const docs = d.docs || [];
+    const books = docs.slice(0, count).map(b => ({
+      title: b.title || "Untitled",
+      author: (b.author_name && b.author_name.slice(0, 3).join(", ")) || "Unknown",
+      year: b.first_publish_year || null,
+      editions: b.edition_count || null,
+      cover: b.cover_i ? ("https://covers.openlibrary.org/b/id/" + b.cover_i + "-M.jpg") : "",
+      link: b.key ? ("https://openlibrary.org" + b.key) : "",
+      subjects: (b.subject || []).slice(0, 4)
+    }));
+    return { ok: true, books };
+  } catch (e) { return { ok: false }; }
+}
+
+// ---- SPORTS: TheSportsDB (free public key), no account ----
+async function getSports(env, cfg, query) {
+  const key = String(cfg.sportsApiKey || "3");
+  const base = "https://www.thesportsdb.com/api/v1/json/" + key + "/";
+  const q = String(query || "").trim();
+  if (!q) return { ok: false, need: "team" };
+  const tRes = await fetchWithTimeout(base + "searchteams.php?t=" + encodeURIComponent(q.slice(0, 60)), {}, 15000);
+  let team = null;
+  if (tRes && tRes.ok) { try { const d = await tRes.json(); team = d.teams && d.teams[0]; } catch (e) {} }
+  if (!team) return { ok: true, team: null, last: [], next: [], note: "no-team" };
+  const info = {
+    id: team.idTeam, name: team.strTeam, league: team.strLeague || "",
+    sport: team.strSport || "", badge: team.strTeamBadge || team.strBadge || "",
+    country: team.strCountry || ""
+  };
+  async function events(kind) {
+    const r = await fetchWithTimeout(base + kind + ".php?id=" + info.id, {}, 15000);
+    if (!r || !r.ok) return [];
+    try {
+      const d = await r.json();
+      const arr = d.results || d.events || [];
+      return (arr || []).slice(0, 6).map(e => ({
+        name: e.strEvent || "", date: e.dateEvent || "", time: e.strTime || "",
+        home: e.strHomeTeam || "", away: e.strAwayTeam || "",
+        hs: e.intHomeScore, as: e.intAwayScore,
+        league: e.strLeague || info.league, venue: e.strVenue || ""
+      }));
+    } catch (e) { return []; }
+  }
+  const last = await events("eventslast");
+  const next = await events("eventsnext");
+  return { ok: true, team: info, last, next };
+}
+
+// ---- CURRENCY convert (reuses your keyless getCurrencyRates) ----
+async function convertCurrency(env, cfg, amount, from, to) {
+  const cr = await getCurrencyRates(env, cfg, from);
+  if (!cr.ok) return { ok: false };
+  const rate = cr.rates[to];
+  if (rate === undefined) return { ok: false, unknown: true };
+  return { ok: true, from, to, amount, rate, result: amount * rate, cached: !!cr.cached };
+}
+
+// ---- ON-SCREEN AI: Zama answers on Weather/Books/Sports/Currency/Videos ----
+// It first pulls the SAME free tool data as the screen, then answers from it,
+// and only web-searches if the tools genuinely don't cover the question.
+async function handleScreenAsk(env, cfg, uid, u, body) {
+  const question = String(body.question || "").trim();
+  if (!question) return json(friendly("Please type a question."), 400);
+  const screen = String(body.screen || "general").toLowerCase().slice(0, 20);
+  const isAdmin = uid === ADMIN_UID;
+  const afford = maxAffordableChars(u, cfg, 1, isAdmin);
+  if (afford < (cfg.charsPerUnit || 500)) return json({ ok: false, limitHit: true, message: u.plan === "paid" ? cfg.paidLimitMessage : cfg.upgradeMessage }, 402);
+  const perms = u.plan === "paid" ? cfg.paidPerms : cfg.freePerms;
+
+  // 1) Gather live tool facts for THIS screen (free keyless tools + your Pexels).
+  let facts = String(body.context || "").slice(0, 6000);   // cards already on screen
+  try {
+    if (screen === "weather") {
+      const w = await getWeather(env, cfg, String(body.city || "").slice(0, 80), (body.lat && body.lng) ? { lat: Number(body.lat), lng: Number(body.lng), name: body.city } : null);
+      if (w.ok) facts += "\nLIVE WEATHER for " + w.place.name + (w.place.country ? ", " + w.place.country : "") +
+        " (real, right now): " + Math.round(w.current.temp) + "\u00B0C, feels " + Math.round(w.current.feels) +
+        "\u00B0C, " + w.current.text + ", humidity " + w.current.humidity + "%, wind " + w.current.wind +
+        " km/h. Next days: " + w.days.map(dd => dd.date + " " + dd.text + " " + Math.round(dd.min) + "-" + Math.round(dd.max) + "\u00B0C, rain " + (dd.rain == null ? "-" : dd.rain + "%")).join(" | ");
+    } else if (screen === "books") {
+      const b = await searchBooks(env, (String(body.query || "") + " " + question).trim(), 8);
+      if (b.ok && b.books.length) facts += "\nLIVE BOOK RESULTS (Open Library, real): " +
+        b.books.map(x => "\u201C" + x.title + "\u201D by " + x.author + (x.year ? " (" + x.year + ")" : "")).join("; ");
+    } else if (screen === "sports") {
+      const s = await getSports(env, cfg, String(body.query || body.team || question).slice(0, 60));
+      if (s.ok && s.team) {
+        const fx = arr => arr.map(e => e.date + " " + e.home + " " + (e.hs != null ? e.hs + "-" + e.as : "vs") + " " + e.away).join(" | ");
+        facts += "\nLIVE SPORTS for " + s.team.name + " (" + s.team.league + "). Recent: " + (fx(s.last) || "none") + ". Upcoming: " + (fx(s.next) || "none") + ".";
+      }
+    } else if (screen === "currency") {
+      const from = String(body.from || "USD").toUpperCase().slice(0, 3);
+      const cr = await getCurrencyRates(env, cfg, from);
+      if (cr.ok) facts += "\n" + currencyBlock(from, cr.rates, ["ZMW", "USD", "EUR", "GBP", "ZAR", "CNY"]);
+    } else if (screen === "videos") {
+      facts += "\nThis is the Videos screen. Clips are pulled from Pexels by topic; suggest good search topics if asked.";
+    }
+  } catch (e) {}
+
+  // 2) Answer from facts; allow ONE web search only if facts don't cover it.
+  const maySearch = body.search !== false && (isAdmin || canSearch(u, cfg, perms));
+  const sys = buildSystemPrompt(cfg, "normal", "", "standard") +
+    "\n\nYou are Zama inside the " + screen.toUpperCase() + " screen of the app. Use the LIVE TOOL DATA below as ground truth - it is real and current. Answer the user's question naturally in clear sentences, never as raw fields or lists of numbers. When rates or figures are involved, do the math exactly." +
+    (maySearch
+      ? " If the tool data genuinely does not contain the answer, reply with ONLY this one line and nothing else: [wod-search: short query] - the system will search the live web and ask you again."
+      : " If it isn't covered, say so honestly and briefly.") +
+    (await skillLawFor(env, cfg, screen + " " + question)) +
+    "\n\nLIVE TOOL DATA:\n" + (facts.trim() || "(no tool data available for this screen)");
+  const messages = [{ role: "system", content: sys }];
+  const history = Array.isArray(body.history) ? body.history.slice(-4) : [];
+  for (const h of history) {
+    if (h && (h.role === "user" || h.role === "assistant") && typeof h.content === "string") messages.push({ role: h.role, content: h.content.slice(0, 1200) });
+  }
+  messages.push({ role: "user", content: question });
+
+  let r = await callStandard(env, cfg, messages, Math.min(900, providerMaxTokens(perms, afford)));
+  if (!r.ok || looksJunk(r.text)) r = await callStandard(env, cfg, messages, 600);
+  if (!r.ok) return json(friendly("Zama is busy right now. Please ask again in a moment."), 502);
+
+  let sources = [];
+  const wantMore = maySearch && String(r.text || "").match(/\[wod-search:\s*([^\]]{2,140})\]/i);
+  if (wantMore) {
+    const sr = await searchWeb(env, cfg, cleanSearchQuery(wantMore[1]), 6);
+    if (sr.ok && sr.results.length) {
+      u.searchesUsed = (u.searchesUsed || 0) + 1;
+      sources = sr.results.map(s => ({ title: s.title, url: s.url }));
+      const msgs2 = messages.slice();
+      msgs2[0] = { role: "system", content: sys + "\n\nWEB SEARCH RESULTS (you asked for these - combine with the tool data and answer NOW, never output [wod-search] again):\n" +
+        sr.results.map((s, i) => "[" + (i + 1) + "] " + s.title + "\n" + s.snippet + "\nURL: " + s.url).join("\n\n") };
+      const r2 = await callStandard(env, cfg, msgs2, Math.min(900, providerMaxTokens(perms, afford)));
+      if (r2.ok) r = r2;
+    } else {
+      r = Object.assign({}, r, { text: String(r.text || "").replace(/\[wod-search:[^\]]*\]/gi, "").trim() || "I couldn't reach the web to check that just now." });
+    }
+  }
+  const budget = await enforceBudget(env, cfg, uid, u, r.text, 1, null);
+  await saveUser(env, uid, u);
+  return json({ ok: true, text: budget.text, cut: budget.cut, message: budget.cut ? budget.cutMessage : null, sources });
 }
 
 export default {
@@ -4404,6 +4772,13 @@ export default {
           if (!cfg.imageGenEnabled) return json({ error: "Image generation is disabled." }, 403);
           let prompt = String(body.prompt || "").trim();
           if (!prompt) return json({ error: "prompt required" }, 400);
+          {
+            const imgCap = u.plan === "paid" ? cfg.imageDailyPaid : cfg.imageDailyFree;
+            dailyToolCounter(u, "imageDay", "imagesToday");
+            if (uid !== ADMIN_UID && !isUnlimited(imgCap) && (u.imagesToday || 0) >= (imgCap || 0)) {
+              return json(friendly("You've used all your images for today. They reset tomorrow" + (u.plan === "paid" ? "." : ", or upgrade for more.")), 403);
+            }
+          }
           if (cfg.imagePromptEnhance !== false && body.enhance !== false) {
             const imgLaw = await skillLawFor(env, cfg, "image generation picture art style " + prompt.slice(0, 120));
             const enh = await callStandard(env, cfg, [
@@ -4421,6 +4796,7 @@ export default {
           if (!r.ok && cfg.pollinationsEnabled !== false) r = await pollinationsImage(prompt);
           if (!r.ok) return json(friendly("Image creation is resting right now. Please try again shortly."), 502);
           deductTokens(u, cfg, unitCost(cfg, 2));
+          u.imagesToday = (u.imagesToday || 0) + 1;
           await saveUser(env, uid, u);
           return json({ ok: true, image: r.image, mime: r.mime, text: r.text || "" });
         }
@@ -4717,6 +5093,46 @@ export default {
           if (!cr.ok) return json(friendly("Live rates are resting right now. Please try again shortly."), 502);
           return json({ ok: true, base: cr.base, rates: cr.rates, cached: !!cr.cached });
         }
+        case "/currency/convert": {
+          if (cfg.currencyEnabled === false) return json(friendly("Currency is switched off right now."), 403);
+          const amt = Number(body.amount);
+          const from = String(body.from || "USD").toUpperCase().slice(0, 3);
+          const to = String(body.to || "ZMW").toUpperCase().slice(0, 3);
+          if (!isFinite(amt)) return json(friendly("Enter an amount to convert."), 400);
+          const c = await convertCurrency(env, cfg, amt, from, to);
+          if (!c.ok) return json(friendly(c.unknown ? "Zama doesn't have a live rate for that pair right now." : "Live rates are resting right now. Please try again shortly."), 502);
+          return json({ ok: true, from, to, amount: amt, rate: c.rate, result: c.result, cached: c.cached });
+        }
+
+        // ===== FREE KEYLESS TOOL SCREENS (no keys, no token cost) =====
+        case "/weather": {
+          if (cfg.weatherEnabled === false) return json(friendly("Weather is switched off right now."), 403);
+          const w = await getWeather(env, cfg, String(body.city || "").slice(0, 80),
+            (body.lat && body.lng) ? { lat: Number(body.lat), lng: Number(body.lng), name: body.city } : null);
+          if (w.need === "city") return json(friendly("Which city's weather should Zama check?"), 400);
+          if (w.notfound) return json(friendly("Zama couldn't find that place. Try adding the country."), 404);
+          if (!w.ok) return json(friendly("Live weather is resting right now. Please try again shortly."), 502);
+          return json({ ok: true, place: w.place, current: w.current, days: w.days });
+        }
+        case "/books": {
+          if (cfg.booksEnabled === false) return json(friendly("Books are switched off right now."), 403);
+          const q = String(body.query || body.q || "").trim();
+          if (!q) return json(friendly("What book or topic should Zama find?"), 400);
+          const b = await searchBooks(env, q, Math.min(20, Number(body.count) || 12));
+          if (!b.ok) return json(friendly("The books library is resting right now. Please try again shortly."), 502);
+          return json({ ok: true, query: q, books: b.books });
+        }
+        case "/sports": {
+          if (cfg.sportsEnabled === false) return json(friendly("Sports are switched off right now."), 403);
+          const q = String(body.query || body.team || "").trim();
+          if (!q) return json(friendly("Which team should Zama look up? (e.g. Zambia, Arsenal, Zesco United)"), 400);
+          const s = await getSports(env, cfg, q);
+          if (!s.ok) return json(friendly("Live sports are resting right now. Please try again shortly."), 502);
+          return json({ ok: true, query: q, team: s.team, last: s.last, next: s.next, note: s.note || null });
+        }
+
+        // ===== AI answers on any screen (uses the free tools, or the web) =====
+        case "/screen/ask": return await handleScreenAsk(env, cfg, uid, u, body);
 
         case "/arena/custom/save": {
           if (cfg.customArenasEnabled === false) return json(friendly("Custom Arenas are switched off."), 403);
@@ -4915,6 +5331,7 @@ export default {
 
         case "/awd/save": return await handleAwdSave(env, cfg, uid, u, body);
         case "/asset/save": return await handleAssetSave(env, cfg, uid, u, body);
+        case "/usage": return await handleUsage(env, cfg, uid, u);
         case "/stats": return await handleStats(env, cfg, uid, u);
 
         default: return json({ error: "unknown endpoint: " + path }, 404);
