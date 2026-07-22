@@ -4737,6 +4737,109 @@ async function handleScreenAsk(env, cfg, uid, u, body) {
   return json({ ok: true, text: budget.text, cut: budget.cut, message: budget.cut ? budget.cutMessage : null, sources });
 }
 
+/* ============================================================
+   BUCKET HOUSE  —  RAG grounded on uploaded curriculum + reports.
+   Stored in Firebase through W1's service account (NO rule changes).
+   Retrieval: BM25 over stored chunks. Generation: reuses the existing
+   provider ladder (callStandard) — NO new keys.
+   Firebase layout:
+     bucketDocs/{docId}          = {id,title,category,form,subject,addedAt,chunks}
+     bucketChunks/{docId}/{cid}  = {id,docId,title,category,form,subject,text}
+   For small corpora this loads all chunks per query; when it grows,
+   move retrieval to the Pinecone satellite (W2).
+   ============================================================ */
+const BUCKET_STOP = new Set("the a an and or of to in on for with is are was were be been being as at by from this that these those it its into their they them then than which who whom whose will would shall can could should may might must have has had do does did not no yes if but so we you he she our your his her".split(" "));
+function bkTokens(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 2 && !BUCKET_STOP.has(w));
+}
+function bkChunk(text) {
+  const clean = String(text || "").replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+  const paras = clean.split(/\n\n+/);
+  const out = []; let buf = "";
+  const flush = () => { if (buf.trim()) out.push(buf.trim()); buf = ""; };
+  for (const p of paras) {
+    if (buf && (buf.length + p.length + 2) > 900) { flush(); buf = p; }
+    else buf = buf ? buf + "\n\n" + p : p;
+  }
+  flush();
+  const final = [];
+  for (const c of out) {
+    if (c.length <= 1300) final.push(c);
+    else for (let i = 0; i < c.length; i += 1000) final.push(c.slice(i, i + 1150));
+  }
+  return final.filter(x => x.length > 12);
+}
+function bkId() { return "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+async function bucketAdd(env, meta, text) {
+  const docId = bkId();
+  const chunks = bkChunk(text);
+  if (!chunks.length) return { ok: false, error: "no usable text to store" };
+  const node = {};
+  chunks.forEach((t, i) => {
+    const cid = docId + "_" + i;
+    node[cid] = { id: cid, docId, title: meta.title || "Untitled", category: meta.category || "", form: meta.form || "", subject: meta.subject || "", text: t };
+  });
+  await fbSet(env, "bucketChunks/" + docId, node);
+  await fbUpdate(env, "bucketDocs/" + docId, { id: docId, title: meta.title || "Untitled", category: meta.category || "", form: meta.form || "", subject: meta.subject || "", addedAt: nowMs(), chunks: chunks.length });
+  return { ok: true, docId, chunks: chunks.length };
+}
+async function bucketDocs(env) {
+  const d = await fbGet(env, "bucketDocs"); if (!d) return [];
+  return Object.values(d).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+}
+async function bucketDelete(env, docId) {
+  if (!docId) return false;
+  await fbDelete(env, "bucketChunks/" + docId);
+  await fbDelete(env, "bucketDocs/" + docId);
+  return true;
+}
+async function bucketLoadChunks(env, filter) {
+  const all = await fbGet(env, "bucketChunks"); if (!all) return [];
+  let arr = [];
+  for (const docId in all) { const n = all[docId]; for (const cid in n) arr.push(n[cid]); }
+  if (filter) {
+    const f = String(filter.form || "").toLowerCase();
+    const s = String(filter.subject || "").toLowerCase();
+    if (f) arr = arr.filter(c => !c.form || String(c.form).toLowerCase() === f || f.includes(String(c.form).toLowerCase()));
+    if (s) arr = arr.filter(c => !c.subject || String(c.subject).toLowerCase().includes(s) || s.includes(String(c.subject).toLowerCase()));
+  }
+  return arr;
+}
+function bucketRank(chunks, query, k) {
+  const q = bkTokens(query); if (!q.length || !chunks.length) return [];
+  const N = chunks.length;
+  const toks = chunks.map(c => bkTokens(c.text));
+  const df = {}; toks.forEach(t => { const seen = new Set(t); seen.forEach(w => { df[w] = (df[w] || 0) + 1; }); });
+  const avg = (toks.reduce((s, t) => s + t.length, 0) / N) || 1;
+  const k1 = 1.5, b = 0.75;
+  const scored = chunks.map((c, i) => {
+    const t = toks[i], len = t.length || 1, tf = {};
+    t.forEach(w => tf[w] = (tf[w] || 0) + 1);
+    let s = 0;
+    q.forEach(w => { if (!tf[w]) return; const idf = Math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5)); s += idf * (tf[w] * (k1 + 1)) / (tf[w] + k1 * (1 - b + b * len / avg)); });
+    return { c, s };
+  });
+  return scored.filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, k || 6).map(x => x.c);
+}
+async function bucketRetrieve(env, query, filter, k) {
+  return bucketRank(await bucketLoadChunks(env, filter), query, k || 6);
+}
+async function bucketAsk(env, cfg, query, filter) {
+  const hits = await bucketRetrieve(env, query, filter, 6);
+  if (!hits.length) return { ok: true, grounded: false, answer: "", sources: [] };
+  const ctx = hits.map((h, i) => "[" + (i + 1) + "] " + (h.title ? h.title + " — " : "") + h.text).join("\n\n");
+  const sys = "You are Zama, grounded on the Bucket House: official Zambian Ministry of Education curriculum and real educational reports. "
+    + "Use ONLY the CONTEXT below. Do not invent syllabus content or facts that are not in the context. "
+    + "If the answer is not in the context, say plainly it is not in the uploaded documents. "
+    + "If the request is a lesson plan, produce a complete plan following the Zambian competence-based structure, grounded only in the context. "
+    + "When you use a report finding, give practical, evidence-based teaching advice. Refer to sources by their titles.";
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + ctx + "\n\nREQUEST:\n" + query }], 1800);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  const seen = {}, sources = [];
+  hits.forEach(h => { const key = (h.title || "") + "|" + (h.category || ""); if (!seen[key]) { seen[key] = 1; sources.push({ title: h.title || "Untitled", category: h.category || "" }); } });
+  return { ok: true, grounded: true, answer: r.text, sources, provider: r.provider };
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return json({ ok: true });
@@ -4767,6 +4870,50 @@ export default {
 
       switch (path) {
         case "/chat": return await handleChat(env, cfg, uid, u, body, email);
+
+        // ---- BUCKET HOUSE (RAG) ----
+        case "/bucket/add": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const text = String(body.text || "").trim();
+          if (text.length < 20) return json(friendly("Paste some document text first."), 400);
+          return json(await bucketAdd(env, {
+            title: String(body.title || "").slice(0, 140),
+            category: String(body.category || "").slice(0, 60),
+            form: String(body.form || "").slice(0, 20),
+            subject: String(body.subject || "").slice(0, 40)
+          }, text.slice(0, 200000)));
+        }
+        case "/bucket/list": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          return json({ ok: true, docs: await bucketDocs(env) });
+        }
+        case "/bucket/delete": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          return json({ ok: await bucketDelete(env, String(body.docId || "")) });
+        }
+        case "/bucket/search": {
+          const hits = await bucketRetrieve(env, String(body.query || ""), { form: body.form, subject: body.subject }, Math.min(body.k || 6, 10));
+          return json({ ok: true, hits: hits.map(h => ({ title: h.title, category: h.category, form: h.form, subject: h.subject, text: String(h.text).slice(0, 400) })) });
+        }
+        case "/bucket/ask": {
+          const q = String(body.query || "").trim();
+          if (q.length < 3) return json(friendly("Ask something first."), 400);
+          const bkAdmin = uid === ADMIN_UID;
+          if (messagesLeft(u, cfg, bkAdmin) <= 0) {
+            return json({ ok: true, grounded: false, limited: true, answer: "", sources: [], message: cfg.limitStopMessage || "You've reached your usage limit for now." });
+          }
+          const bkRes = await bucketAsk(env, cfg, q, { form: body.form, subject: body.subject });
+          if (bkRes.ok && bkRes.grounded && bkRes.answer) {
+            const bkBudget = await enforceBudget(env, cfg, uid, u, bkRes.answer, 1, { type: "bucket" });
+            await saveUser(env, uid, u);
+            bkRes.answer = bkBudget.text;
+            bkRes.cut = bkBudget.cut;
+            if (bkBudget.cut) bkRes.message = bkBudget.cutMessage;
+            const bkWarn = buildWarning(u, cfg, bkAdmin);
+            if (bkWarn) bkRes.warning = bkWarn;
+          }
+          return json(bkRes);
+        }
         case "/skills/peek": {
           // Live-status ticker support: skill NAMES and half previews only.
           if (!cfg.dockSkillsEnabled) return json({ ok: true, skills: [] });
