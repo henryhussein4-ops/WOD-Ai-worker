@@ -1297,6 +1297,30 @@ async function fetchNewsDataDirect(env, cfg, query, count) {
   return { ok: false, apiError: lastErr, exhausted: true, keysTotal: keys.length, results: [] };
 }
 
+// Rejects scraped homepage / login / navigation text that some sites return
+// instead of real article content ("Sign in", "password recovery", etc.).
+function isJunkNews(t) {
+  return /log ?in|sign ?in|log into your account|password recover|forgot your password|your username|create an account|subscribe now|newsletter|cookie polic|% of the html|welcome!|advertisement|skip to (content|main)|main menu|leading online news site|latest news from [a-z]+ sign in|view full coverage/i
+    .test(String(t || "").toLowerCase());
+}
+// Cleans a raw news list: drops junk/homepage dumps, splits "Headline - Source",
+// trims snippets and removes duplicate headlines. Keeps images.
+function cleanNewsList(list) {
+  const seen = {}, out = [];
+  for (const r of (list || [])) {
+    if (!r || !r.title) continue;
+    let title = String(r.title).replace(/\s+/g, " ").trim();
+    let snippet = String(r.snippet || "").replace(/\s+/g, " ").trim();
+    let source = r.source || "";
+    const dash = title.lastIndexOf(" - ");
+    if (!source && dash > 15 && (title.length - dash) < 45) { source = title.slice(dash + 3).trim(); title = title.slice(0, dash).trim(); }
+    if (isJunkNews(title) || isJunkNews(snippet)) continue;          // homepage / login dump -> drop whole item
+    const key = title.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 50);
+    if (!key || seen[key]) continue; seen[key] = 1;
+    out.push({ title, url: r.url || "", snippet: snippet.slice(0, 700), image: r.image || "", source, date: r.date || "" });
+  }
+  return out;
+}
 async function searchNewsWorker(env, cfg, query, count, opts) {
   const key = "newsCache/" + safeKey(query.toLowerCase().slice(0, 80));
   let stale = null;
@@ -1318,17 +1342,18 @@ async function searchNewsWorker(env, cfg, query, count, opts) {
     return { ok: false, limited: true, results: [] };
   }
 
-  // 1) DIRECT NewsData.io with your key (preferred).
+  // 1) DIRECT NewsData.io with your key (preferred — clean articles + images).
   let direct = null;
   if (cfg.newsDirect !== false) {
     direct = await fetchNewsDataDirect(env, cfg, query, count);
     if (direct.ok && direct.results.length) {
-      await fbSet(env, key, { results: direct.results, fetchedAt: nowMs() });
-      return { ok: true, results: direct.results, fresh: true, via: "newsdata" };
+      const results = cleanNewsList(direct.results);
+      if (results.length) { await fbSet(env, key, { results, fetchedAt: nowMs() }); return { ok: true, results, fresh: true, via: "newsdata" }; }
     }
   }
 
-  // 2) Fall back to the external news worker (if still configured).
+  // 2) Fall back to the external news worker (if still configured). Homepage/login
+  //    dumps are filtered out; if nothing clean remains we fall through to RSS.
   const base = cfg.newsSearchWorker;
   if (base) {
     const res = await fetchWithTimeout(base + (base.indexOf("?") === -1 ? "?q=" : "&q=") + encodeURIComponent(query), {}, 20000);
@@ -1336,26 +1361,23 @@ async function searchNewsWorker(env, cfg, query, count, opts) {
       try {
         const d = await res.json();
         const arr = d.sources || d.articles || d.results || [];
-        const results = arr.slice(0, Math.min(count || 10, 20)).map(r => ({
+        const results = cleanNewsList(arr.map(r => ({
           title: r.title || "", url: r.url || r.link || "",
-          snippet: String(r.text || r.snippet || r.content || r.description || "").slice(0, 900)
-        })).filter(r => r.title);
+          snippet: String(r.text || r.snippet || r.content || r.description || "").slice(0, 900),
+          image: r.image || r.image_url || r.thumbnail || "", source: r.source || ""
+        })));
         if (results.length) { await fbSet(env, key, { results, fetchedAt: nowMs() }); return { ok: true, results, fresh: true, via: "worker" }; }
       } catch (e) {}
     }
   }
 
-  // 3) KEYLESS fallback: Google News RSS (needs no key, always available).
-  // This is the "news that needs no key" - Zambia-focused when country is zm.
+  // 3) KEYLESS fallback: Google News RSS. Its descriptions are related-link lists,
+  //    not article text, so we keep only the clean headline + source.
   try {
     const rssQ = (cfg.newsCountry === "zm" && !/zambia/i.test(query)) ? (query + " Zambia") : query;
     const rss = await searchGoogleNewsRss(rssQ, Math.min(count || 10, 20));
     if (rss && rss.length) {
-      const results = rss.map(r => ({
-        title: r.title || "", url: r.url || "",
-        snippet: String(r.snippet || "").slice(0, 900),
-        image: "", source: r.source || "", date: ""
-      })).filter(r => r.title);
+      const results = cleanNewsList(rss.map(r => ({ title: r.title || "", url: r.url || "", snippet: "", image: "", source: r.source || "" })));
       if (results.length) { await fbSet(env, key, { results, fetchedAt: nowMs() }); return { ok: true, results, fresh: true, via: "rss" }; }
     }
   } catch (e) {}
@@ -3992,7 +4014,11 @@ async function handleNewsFeed(env, cfg, uid, u, body) {
   }
   u.searchesUsed = (u.searchesUsed || 0) + 1;
   await saveUser(env, uid, u);
-  return json({ ok: true, topic, cached: !!r.cached, articles: r.results });
+  const articles = cleanNewsList(r.results);
+  if (!articles.length) {
+    return json(friendly("No clean news to show right now. Add your NewsData.io keys in the Panel for full articles with images."), 502);
+  }
+  return json({ ok: true, topic, cached: !!r.cached, via: r.via || null, articles });
 }
 
 // ===== VIDEOS (Pexels, your key) =====
