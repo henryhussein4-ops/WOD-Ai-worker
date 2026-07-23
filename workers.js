@@ -585,6 +585,11 @@ async function saveUser(env, uid, u) {
     ttsDay: u.ttsDay || "", ttsToday: u.ttsToday || 0,
     imageDay: u.imageDay || "", imagesToday: u.imagesToday || 0,
     fileDay: u.fileDay || "", filesToday: u.filesToday || 0,
+    lessonDay: u.lessonDay || "", lessonsToday: u.lessonsToday || 0,
+    studyDay: u.studyDay || "", studyToday: u.studyToday || 0,
+    caps: u.caps || {}, emailIndexed: u.emailIndexed === true,
+    tokWeek: u.tokWeek || "", tokWeekLeft: u.tokWeekLeft === undefined ? null : u.tokWeekLeft,
+    tokDay: u.tokDay || "", tokDayLeft: u.tokDayLeft === undefined ? null : u.tokDayLeft,
     arenaUse: u.arenaUse || {}, lastTool: u.lastTool || null
   });
 }
@@ -4840,6 +4845,1272 @@ async function bucketAsk(env, cfg, query, filter) {
   return { ok: true, grounded: true, answer: r.text, sources, provider: r.provider };
 }
 
+// Lesson generation with clarify-gating: if the request is missing Form/grade,
+// topic OR subject, Zama asks instead of guessing. Otherwise it returns a short
+// intro plus a clean markdown lesson plan, grounded only on Bucket House.
+async function bucketLesson(env, cfg, query, filter, prof) {
+  const p = prof || {};
+  const found = await bucketAcrossDocs(env, query, Object.assign({ kind: "curriculum" }, filter || {}), 6, 3);
+  let hits = found.chunks;
+  if (!hits.length) hits = await bucketSmart(env, query, filter, 6);
+  const ctx = hits.length ? bkContext(hits) : "(nothing found in the library)";
+  const sizeNote = classSizeNote(p);
+  const sys = "You are Zama, a Zambian teaching assistant. You write lesson plans grounded ONLY on the official curriculum/report CONTEXT provided. "
+    + "First check the teacher's request names all three of: (a) the Form/grade, (b) the topic, (c) the subject. "
+    + "If ANY is missing, DO NOT write a plan. Reply with exactly:\nNEED: <one short friendly sentence asking only for the missing detail(s)>\n"
+    + "If all three are present but the CONTEXT does not cover that topic, reply with exactly:\nNEED: I don't have that topic in the library yet - please add it to Bucket House first.\n"
+    + "If all three are present AND the CONTEXT covers it, reply in EXACTLY this shape and nothing else:\n"
+    + "INTRO: <2-3 sentences saying what you will create and that it follows the Zambian syllabus>\n"
+    + "PLAN:\n<a complete lesson plan in clean markdown. Use ## for section headings and **bold** for labels and - for bullets. Base EVERY part only on the CONTEXT. Never invent facts or topics.>";
+  const usr = "CONTEXT:\n" + ctx
+    + "\n\nTEACHER: " + teacherLine(p)
+    + (sizeNote ? "\nCLASS REALITY: " + sizeNote : "")
+    + "\n\nTEACHER REQUEST:\n" + query;
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 1900);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  let out = String(r.text || "").trim();
+  if (/^NEED:/i.test(out)) return { ok: true, kind: "clarify", message: out.replace(/^NEED:\s*/i, "").trim() };
+  let intro = "", plan = "";
+  const pi = out.search(/(^|\n)\s*PLAN:/i);
+  if (pi > -1) {
+    intro = out.slice(0, pi).replace(/(^|\n)\s*INTRO:\s*/i, "").trim();
+    plan = out.slice(pi).replace(/(^|\n)\s*PLAN:\s*/i, "").trim();
+  } else {
+    plan = out.replace(/(^|\n)\s*INTRO:\s*/i, "").trim();
+  }
+  if (!plan || plan.length < 40) return { ok: true, kind: "clarify", message: "Please tell me the Form/grade, subject and topic for the lesson." };
+  return { ok: true, kind: "plan", intro: intro || "Here is a lesson plan grounded on the Zambian syllabus.", plan, sources: bkSources(hits) };
+}
+
+// Minimal server-side markdown -> HTML for the public shared page.
+function escHtmlSrv(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function mdToHtmlSrv(md) {
+  let s = escHtmlSrv(md);
+  s = s.replace(/^\s*#{4,6}\s+(.+)$/gm, '<h4>$1</h4>');
+  s = s.replace(/^\s*#{1,3}\s+(.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^\s*&gt;\s?(.+)$/gm, '<blockquote>$1</blockquote>');
+  s = s.replace(/^\s*---\s*$/gm, '<hr>');
+  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/^\s*(?:- |\* )(.+)$/gm, '<li>$1</li>');
+  s = s.replace(/(<li>[\s\S]*?<\/li>)/g, m => '<ul>' + m + '</ul>');
+  s = s.split(/\n{2,}/).map(b => /^\s*<(h3|h4|ul|li|blockquote|hr)/.test(b.trim()) ? b : '<p>' + b.replace(/\n/g, '<br>') + '</p>').join("");
+  return s;
+}
+function sharePage(title, plan) {
+  const body = mdToHtmlSrv(plan);
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>' + escHtmlSrv(title) + '</title>'
+    + '<style>body{margin:0;background:#0c0e0d;color:#e8ebee;font-family:-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;line-height:1.6;}'
+    + '.wrap{max-width:720px;margin:0 auto;padding:26px 18px 60px;}'
+    + '.brand{display:flex;align-items:center;gap:8px;color:#39c082;font-weight:700;font-size:13px;margin-bottom:6px;letter-spacing:.3px;}'
+    + 'h1{font-size:21px;margin:4px 0 20px;}h3{color:#39c082;font-size:16px;margin:22px 0 8px;}h4{color:#cfe9db;font-size:14px;margin:16px 0 6px;}'
+    + 'p{margin:9px 0;}ul{margin:8px 0;padding-left:20px;}li{margin:4px 0;}strong{color:#fff;}'
+    + 'blockquote{border-left:3px solid #2fa36b;margin:12px 0;padding:6px 12px;background:#12161a;color:#cdd3da;border-radius:0 8px 8px 0;}'
+    + 'hr{border:none;border-top:1px solid #20252b;margin:20px 0;}'
+    + '.ft{margin-top:34px;padding-top:16px;border-top:1px solid #20252b;color:#6b7280;font-size:12px;}</style></head>'
+    + '<body><div class="wrap"><div class="brand">ZAMA · WORLD OF DISCOVERIES</div><h1>' + escHtmlSrv(title) + '</h1>' + body
+    + '<div class="ft">Generated by Zama, grounded on the Zambian curriculum.</div></div></body></html>';
+}
+
+/* ---- Bucket House limits (owned by the Bucket House app) ----
+   Stored in its own Firebase node "bucketConfig" — deliberately NOT inside
+   "config", because the Panel saves config with a full overwrite and would
+   wipe any key it doesn't know about. 0 or less = unlimited. */
+/* Older call sites use bucketGate/bucketCharge with kind "lesson"/"study".
+   They now delegate to the generic, fully configurable cap system. */
+function bucketGate(u, bh, isAdmin, kind) { return capGate(u, bh, isAdmin, kind === "study" ? "study" : "lesson"); }
+function bucketCharge(u, kind) { capCharge(u, kind === "study" ? "study" : "lesson"); }
+
+/* ============================================================
+   INTELLIGENT RETRIEVAL
+   Bucket House is NOT searched on every request. Zama decides when
+   evidence is needed, and which KIND of document to read (ECZ papers
+   vs school tests vs syllabus vs reports vs school records).
+   ============================================================ */
+function bkNorm(s) { return String(s || "").toLowerCase().trim(); }
+// Which document category does this request call for?
+function bucketDocKind(text) {
+  const t = bkNorm(text);
+  if (/\becz\b|past paper|exam paper|final exam|grade 7|grade 9|grade 12 exam|examination paper/.test(t)) return "ecz";
+  if (/school test|class test|mock|end of term|monthly test|assessment|classroom revision/.test(t)) return "test";
+  if (/syllabus|curriculum|competence|scheme of work|lesson plan|topics? covered|coverage/.test(t)) return "curriculum";
+  if (/examiner report|observation|research|finding|common mistake|weakness report/.test(t)) return "report";
+  if (/school|pupils|enrol|district|province/.test(t) && /which school|about .*school|our school|school profile/.test(t)) return "school";
+  return "";
+}
+// Should we consult the library at all? Greetings and small talk shouldn't.
+function bucketNeedsLibrary(text) {
+  const t = bkNorm(text);
+  if (t.length < 4) return false;
+  if (/^(hi|hello|hey|good (morning|afternoon|evening)|thanks|thank you|ok|okay|bye|how are you)\b/.test(t)) return false;
+  if (/what can you (do|help)|who are you|how do you work|what do you offer/.test(t)) return false;
+  return true;
+}
+function bkMatch(field, want) {
+  if (!want) return true;
+  const f = bkNorm(field), w = bkNorm(want);
+  if (!f) return true;               // untagged chunks stay eligible
+  return f === w || f.indexOf(w) > -1 || w.indexOf(f) > -1;
+}
+function bkFilterChunks(chunks, filter) {
+  if (!filter) return chunks;
+  const cats = (filter.categories || []).map(bkNorm).filter(Boolean);
+  return chunks.filter(c => {
+    if (!bkMatch(c.form, filter.form)) return false;
+    if (!bkMatch(c.subject, filter.subject)) return false;
+    if (cats.length) {
+      const cc = bkNorm(c.category);
+      if (cc && !cats.some(x => cc.indexOf(x) > -1 || x.indexOf(cc) > -1)) return false;
+    }
+    if (filter.school) {
+      const hay = bkNorm(c.title) + " " + bkNorm(c.text);
+      if (hay.indexOf(bkNorm(filter.school)) === -1) return false;
+    }
+    return true;
+  });
+}
+const BK_CAT_MAP = {
+  ecz: ["ecz", "past paper", "exam"],
+  test: ["test", "mock", "assessment", "school test"],
+  curriculum: ["curriculum", "syllabus", "teacher guide"],
+  report: ["report", "examiner", "observation", "research"],
+  school: ["school"]
+};
+async function bucketSmart(env, query, filter, k) {
+  const all = await bucketLoadChunks(env, null);
+  if (!all.length) return [];
+  const kind = (filter && filter.kind) || bucketDocKind(query);
+  const f = Object.assign({}, filter || {});
+  if (kind && BK_CAT_MAP[kind]) f.categories = BK_CAT_MAP[kind];
+  let pool = bkFilterChunks(all, f);
+  if (pool.length < 3) pool = bkFilterChunks(all, { form: f.form, subject: f.subject });  // widen
+  if (pool.length < 3) pool = all;                                                        // last resort
+  return bucketRank(pool, query, k || 6);
+}
+// Reads ACROSS several documents (e.g. "study 5-10 ECZ papers") so Zama can
+// learn patterns rather than copy one paper.
+async function bucketAcrossDocs(env, query, filter, maxDocs, perDoc) {
+  const all = await bucketLoadChunks(env, null);
+  if (!all.length) return { chunks: [], docs: [] };
+  const kind = (filter && filter.kind) || bucketDocKind(query);
+  const f = Object.assign({}, filter || {});
+  if (kind && BK_CAT_MAP[kind]) f.categories = BK_CAT_MAP[kind];
+  let pool = bkFilterChunks(all, f);
+  if (pool.length < 3) pool = bkFilterChunks(all, { form: f.form, subject: f.subject });
+  if (!pool.length) return { chunks: [], docs: [] };
+  const ranked = bucketRank(pool, query, 60);
+  const byDoc = {}, order = [];
+  ranked.forEach(c => {
+    if (!byDoc[c.docId]) { byDoc[c.docId] = []; order.push(c.docId); }
+    if (byDoc[c.docId].length < (perDoc || 2)) byDoc[c.docId].push(c);
+  });
+  const docIds = order.slice(0, maxDocs || 8);
+  const chunks = [];
+  docIds.forEach(d => byDoc[d].forEach(c => chunks.push(c)));
+  const docs = docIds.map(d => (byDoc[d][0] && byDoc[d][0].title) || "Untitled");
+  return { chunks, docs };
+}
+function bkContext(chunks) {
+  return chunks.map((h, i) => "[" + (i + 1) + "] " + (h.title ? h.title + " — " : "") + h.text).join("\n\n");
+}
+function bkSources(chunks) {
+  const seen = {}, out = [];
+  (chunks || []).forEach(h => { const k = (h.title || "") + "|" + (h.category || ""); if (!seen[k]) { seen[k] = 1; out.push({ title: h.title || "Untitled", category: h.category || "" }); } });
+  return out;
+}
+// Tolerant JSON parse for model output.
+function parseJsonLoose(s) {
+  if (!s) return null;
+  let t = String(s).trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try { return JSON.parse(t); } catch (e) {}
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  const c = t.indexOf("["), d = t.lastIndexOf("]");
+  const tryIt = (x) => { try { return JSON.parse(x); } catch (e) { return null; } };
+  if (c > -1 && d > c && (c < a || a === -1)) { const r = tryIt(t.slice(c, d + 1)); if (r) return r; }
+  if (a > -1 && b > a) { const r = tryIt(t.slice(a, b + 1)); if (r) return r; }
+  return null;
+}
+
+/* ============================================================
+   ZAMA FOR TEACHERS
+   Knows the teacher's school, classes, class size and topics already
+   covered, so plans fit THAT school and that class - and can compare
+   what has been taught against the official syllabus.
+   ============================================================ */
+const TEACHER_FIELDS = ["name", "school", "district", "province", "subjects", "forms", "classes", "learners", "covered", "termEndsAt", "notes"];
+async function teacherProfile(env, uid) {
+  let p = null;
+  try { p = await fbGet(env, "teachers/" + uid); } catch (e) {}
+  p = p || {};
+  p.subjects = Array.isArray(p.subjects) ? p.subjects : (p.subjects ? String(p.subjects).split(/,\s*/) : []);
+  p.forms = Array.isArray(p.forms) ? p.forms : (p.forms ? String(p.forms).split(/,\s*/) : []);
+  p.covered = p.covered && typeof p.covered === "object" ? p.covered : {};
+  return p;
+}
+async function saveTeacherProfile(env, uid, body) {
+  const p = await teacherProfile(env, uid);
+  const patch = {};
+  TEACHER_FIELDS.forEach(k => { if (body[k] !== undefined && body[k] !== null) patch[k] = body[k]; });
+  if (patch.subjects && !Array.isArray(patch.subjects)) patch.subjects = String(patch.subjects).split(/,\s*/).filter(Boolean);
+  if (patch.forms && !Array.isArray(patch.forms)) patch.forms = String(patch.forms).split(/,\s*/).filter(Boolean);
+  ["classes", "learners"].forEach(k => { if (patch[k] !== undefined) { const n = parseInt(patch[k], 10); patch[k] = isNaN(n) ? null : Math.max(0, Math.min(10000, n)); } });
+  ["name", "school", "district", "province", "notes"].forEach(k => { if (patch[k] !== undefined) patch[k] = String(patch[k]).slice(0, 160); });
+  const next = Object.assign({}, p, patch, { updatedAt: nowMs() });
+  await fbUpdate(env, "teachers/" + uid, next);
+  return next;
+}
+// Record topics a teacher has taught: covered[subject|form] = [topics]
+async function teacherMarkCovered(env, uid, subject, form, topics) {
+  const p = await teacherProfile(env, uid);
+  const key = (bkNorm(subject) || "general") + "|" + (bkNorm(form) || "any");
+  const list = Array.isArray(p.covered[key]) ? p.covered[key] : [];
+  (topics || []).forEach(t => { const v = String(t).trim(); if (v && list.indexOf(v) === -1) list.push(v); });
+  p.covered[key] = list.slice(0, 400);
+  await fbUpdate(env, "teachers/" + uid, { covered: p.covered, updatedAt: nowMs() });
+  return p.covered[key];
+}
+function teacherLine(p) {
+  const bits = [];
+  if (p.name) bits.push("Teacher: " + p.name);
+  if (p.school) bits.push("School: " + p.school + (p.district ? " (" + p.district + ")" : ""));
+  if (p.subjects && p.subjects.length) bits.push("Subjects: " + p.subjects.join(", "));
+  if (p.forms && p.forms.length) bits.push("Forms taught: " + p.forms.join(", "));
+  if (p.classes) bits.push("Classes: " + p.classes);
+  if (p.learners) bits.push("Learners in total: " + p.learners);
+  return bits.length ? bits.join(" | ") : "(no teacher profile saved yet)";
+}
+function teacherMissing(p) {
+  const miss = [];
+  if (!p.school) miss.push("the school you teach at");
+  if (!p.classes) miss.push("how many classes you teach");
+  if (!p.learners) miss.push("how many learners you have in total");
+  if (!p.subjects || !p.subjects.length) miss.push("the subject(s) you teach");
+  if (!p.forms || !p.forms.length) miss.push("the Form(s) you teach");
+  return miss;
+}
+// Class-size aware teaching guidance, so plans are realistic for that room.
+function classSizeNote(p) {
+  const n = p.learners && p.classes ? Math.round(p.learners / Math.max(1, p.classes)) : (p.learners || 0);
+  if (!n) return "";
+  if (n >= 60) return "Class of about " + n + " learners: prefer whole-class demonstrations, choral checks, pair work and group tasks that need few materials. Individual marking must be sampled, not exhaustive.";
+  if (n >= 40) return "Class of about " + n + " learners: use group work of 5-6, shared materials and quick whole-class checks.";
+  return "Class of about " + n + " learners: individual and small-group work is practical.";
+}
+
+/* Teacher conversation router: greeting / capability / coverage / lesson. */
+function teacherIntent(text) {
+  const t = bkNorm(text);
+  if (/^(hi|hello|hey|good (morning|afternoon|evening)|how are you)\b/.test(t)) return "greet";
+  if (/what can you (do|help)|how can you help|who are you|what do you offer|help me with/.test(t)) return "capability";
+  if (/covered|coverage|remaining|what.?s left|behind|ahead|compare.*syllabus|syllabus.*compare|how far/.test(t)) return "coverage";
+  if (/lesson plan|scheme of work|plan a lesson|create.*plan|prepare.*lesson/.test(t)) return "lesson";
+  return "chat";
+}
+async function teacherCoverage(env, cfg, p, subject, form) {
+  const subj = subject || (p.subjects && p.subjects[0]) || "";
+  const frm = form || (p.forms && p.forms[0]) || "";
+  if (!subj || !frm) return { ok: true, kind: "clarify", message: "Which subject and Form should I check? For example: \"How far am I in Form 3 Civic Education?\"" };
+  const found = await bucketAcrossDocs(env, (subj + " " + frm + " syllabus topics").trim(), { kind: "curriculum", subject: subj, form: frm }, 6, 3);
+  if (!found.chunks.length) return { ok: true, kind: "clarify", message: "I don't have the " + subj + " syllabus for " + frm + " in the library yet. Please add it in Bucket House first." };
+  const key = (bkNorm(subj) || "general") + "|" + (bkNorm(frm) || "any");
+  const covered = (p.covered && p.covered[key]) || [];
+  const sys = "You are Zama, helping a Zambian teacher check syllabus coverage. Use ONLY the CONTEXT (official syllabus). "
+    + "List the syllabus topics, mark which the teacher has already covered, and which remain. Never invent topics. "
+    + "Finish with a short, realistic suggestion of what to teach next. Use clean markdown with ## headings and - bullets.";
+  const usr = "CONTEXT (syllabus):\n" + bkContext(found.chunks)
+    + "\n\nTEACHER: " + teacherLine(p)
+    + "\nTOPICS ALREADY COVERED (teacher's own record): " + (covered.length ? covered.join(", ") : "(none recorded yet)")
+    + "\n\nCompare coverage for " + subj + " " + frm + ".";
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 1400);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  return { ok: true, kind: "coverage", text: r.text, sources: bkSources(found.chunks), docs: found.docs };
+}
+async function teacherChat(env, cfg, bh, uid, p, message, history) {
+  const ob = onboardNext(p, "teacher");
+  if (!ob.complete && !/^(hi|hello|hey)\b/i.test(String(message).trim())) {
+    return { ok: true, kind: "onboard", question: ob.question, field: ob.field, answered: ob.answered, total: ob.total };
+  }
+  const intent = teacherIntent(message);
+  const mems = await memoryLoad(env, "teacher", uid);
+  const custom = p.instructions && bkNorm(p.instructions) !== "none" ? "ALWAYS follow this teacher's standing instructions: " + p.instructions + ". " : "";
+  if (intent === "greet" || intent === "capability") {
+    const miss = teacherMissing(p);
+    const sys = bhPrompt(bh, "SCOPE: Zama for Teachers - teaching support only. " + custom
+      + "Reply in 2-4 short sentences: say you can build syllabus-grounded lesson plans, check syllabus coverage, explain why learners struggle, and suggest strategies for their class size. "
+      + (miss.length ? "Then ask ONLY for these missing details, briefly: " + miss.join(", ") + "." : "Then ask what they would like to prepare."));
+    const r = await callStandard(env, arenaCfg(cfg, bh, "teachers"), [{ role: "system", content: sys }, { role: "user", content: "TEACHER: " + teacherLine(p) + (mems.length ? "\nI REMEMBER:\n" + memoryLines(mems, 8) : "") + "\n\nThey said: " + message }], 500);
+    return r.ok ? { ok: true, kind: "chat", text: r.text, missing: miss } : { ok: false, error: r.error };
+  }
+  if (intent === "coverage") {
+    const subj = (message.match(/\b(mathematics|maths|english|science|biology|chemistry|physics|civic education|history|geography|agriculture|computer studies|religious education)\b/i) || [])[0] || "";
+    const frm = (message.match(/\b(?:form|grade)\s*\d{1,2}\b/i) || [])[0] || "";
+    return await teacherCoverage(env, cfg, p, subj, frm);
+  }
+  const useLib = bucketNeedsLibrary(message);
+  const hits = useLib ? await bucketSmart(env, message, { subject: (p.subjects || [])[0] }, 6) : [];
+  const school = useLib ? await schoolEvidence(env, p.school, (p.subjects || [])[0]) : [];
+  const sys = bhPrompt(bh, "SCOPE: Zama for Teachers - teaching support only; politely decline unrelated topics. " + custom
+    + (hits.length ? "" : "You have no CONTEXT here, so do not claim to quote the syllabus. ")
+    + (school.length ? "School evidence is provided; use it only if it genuinely relates. " : "")
+    + "Be practical and brief, and respect the class size.");
+  const msgs = [{ role: "system", content: sys }];
+  (history || []).slice(-6).forEach(h => { if (h && h.role && h.content) msgs.push({ role: h.role === "assistant" ? "assistant" : "user", content: String(h.content).slice(0, 1200) }); });
+  msgs.push({ role: "user", content:
+    (hits.length ? "CONTEXT:\n" + bkContext(hits) + "\n\n" : "")
+    + (school.length ? "SCHOOL EVIDENCE (" + p.school + "):\n" + bkContext(school) + "\n\n" : "")
+    + (mems.length ? "WHAT I REMEMBER ABOUT THIS TEACHER:\n" + memoryLines(mems, 10) + "\n\n" : "")
+    + "TEACHER: " + teacherLine(p) + (classSizeNote(p) ? "\n" + classSizeNote(p) : "") + "\n\nQUESTION: " + message });
+  const r = await callStandard(env, arenaCfg(cfg, bh, "teachers"), msgs, 1200);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  let learned = [];
+  const memJobT = memoryFilter(env, cfg, bh, "teacher", uid, message, r.text);
+  if (!(env.__bg && env.__bg(memJobT))) { try { learned = await memJobT; } catch (e) {} }
+  return { ok: true, kind: "chat", text: r.text, sources: bkSources(hits.concat(school)), usedSchool: !!school.length, learned };
+}
+
+/* ============================================================
+   ZAMA FOR STUDENTS
+   Its own memory namespace (students/{uid}) holding the learning
+   profile, mastery per topic, spaced-revision schedule and history.
+   Learning is grounded on Bucket House (ECZ papers, school tests,
+   syllabus) and Zama decides when to consult it.
+   ============================================================ */
+async function studentProfile(env, uid) {
+  let p = null;
+  try { p = await fbGet(env, "students/" + uid + "/profile"); } catch (e) {}
+  p = p || {};
+  p.subjects = Array.isArray(p.subjects) ? p.subjects : (p.subjects ? String(p.subjects).split(/,\s*/) : []);
+  p.mastery = p.mastery && typeof p.mastery === "object" ? p.mastery : {};
+  p.goals = p.goals || "";
+  return p;
+}
+async function saveStudentProfile(env, uid, body) {
+  const p = await studentProfile(env, uid);
+  const patch = {};
+  ["name", "grade", "school", "goals", "career", "language"].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]).slice(0, 160); });
+  if (body.subjects !== undefined) patch.subjects = Array.isArray(body.subjects) ? body.subjects : String(body.subjects).split(/,\s*/).filter(Boolean);
+  if (body.examDate !== undefined) patch.examDate = String(body.examDate).slice(0, 20);
+  if (body.studyMinutes !== undefined) { const n = parseInt(body.studyMinutes, 10); patch.studyMinutes = isNaN(n) ? null : Math.max(0, Math.min(1440, n)); }
+  const next = Object.assign({}, p, patch, { updatedAt: nowMs() });
+  await fbUpdate(env, "students/" + uid + "/profile", next);
+  return next;
+}
+function studentLine(p) {
+  const b = [];
+  if (p.name) b.push("Name: " + p.name);
+  if (p.grade) b.push("Grade/Form: " + p.grade);
+  if (p.school) b.push("School: " + p.school);
+  if (p.subjects && p.subjects.length) b.push("Subjects: " + p.subjects.join(", "));
+  if (p.career) b.push("Career goal: " + p.career);
+  if (p.examDate) b.push("Exam date: " + p.examDate);
+  const weak = weakTopics(p, 3);
+  if (weak.length) b.push("Weak topics: " + weak.join(", "));
+  return b.length ? b.join(" | ") : "(new student, no profile yet)";
+}
+/* mastery: EWMA per topic + simple spaced revision (SM-2-lite) */
+function masteryKey(subject, topic) { return (bkNorm(subject) || "general") + "|" + bkNorm(topic).slice(0, 60); }
+function updateMastery(p, subject, topic, score01) {
+  const k = masteryKey(subject, topic);
+  const cur = p.mastery[k] || { m: 0.4, n: 0, streak: 0, interval: 1 };
+  const alpha = 0.35;
+  const m = Math.max(0, Math.min(1, cur.m * (1 - alpha) + Math.max(0, Math.min(1, score01)) * alpha));
+  const ok = score01 >= 0.6;
+  const streak = ok ? (cur.streak || 0) + 1 : 0;
+  const interval = ok ? Math.min(30, Math.max(1, Math.round((cur.interval || 1) * (streak >= 2 ? 2.2 : 1.6)))) : 1;
+  p.mastery[k] = { m, n: (cur.n || 0) + 1, streak, interval, subject, topic, at: nowMs(), due: nowMs() + interval * 86400000 };
+  return p.mastery[k];
+}
+function weakTopics(p, n) {
+  return Object.values(p.mastery || {}).filter(x => x && x.topic).sort((a, b) => (a.m || 0) - (b.m || 0)).slice(0, n || 5).map(x => x.topic);
+}
+function dueTopics(p, n) {
+  const t = nowMs();
+  return Object.values(p.mastery || {}).filter(x => x && x.due && x.due <= t).sort((a, b) => (a.due || 0) - (b.due || 0)).slice(0, n || 5);
+}
+function readiness(p) {
+  const vals = Object.values(p.mastery || {}).map(x => x && x.m).filter(v => typeof v === "number");
+  if (!vals.length) return null;
+  const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+  return { score: Math.round(avg * 100), topics: vals.length };
+}
+function daysToExam(p) {
+  if (!p.examDate) return null;
+  const d = Date.parse(p.examDate);
+  if (isNaN(d)) return null;
+  return Math.max(0, Math.round((d - Date.now()) / 86400000));
+}
+async function studentLog(env, uid, entry) {
+  try { await fbPush(env, "students/" + uid + "/history", Object.assign({ at: nowMs() }, entry)); } catch (e) {}
+}
+
+/* Conversational tutor - consults Bucket House only when useful. */
+async function studentChat(env, cfg, bh, uid, p, message, history) {
+  // #1 onboarding must finish first
+  const ob = onboardNext(p, "student");
+  if (!ob.complete) return { ok: true, kind: "onboard", question: ob.question, field: ob.field, answered: ob.answered, total: ob.total };
+  const useLib = bucketNeedsLibrary(message);
+  const hits = useLib ? await bucketSmart(env, message, { form: p.grade, subject: (p.subjects || [])[0] }, 6) : [];
+  const school = useLib ? await schoolEvidence(env, p.school, (message.match(/\b(mathematics|maths|english|science|biology|chemistry|physics|civic education|history|geography)\b/i) || [])[0]) : [];
+  const mems = await memoryLoad(env, "student", uid);
+  const sys = bhPrompt(bh,
+    "SCOPE: you are Zama for Students - educational help only. If asked something unrelated to learning, politely say it is outside this arena and offer to help with study instead. "
+    + "Teach step by step in simple English at the learner's grade, using familiar Zambian examples when they help. "
+    + "Never give a straight answer to a practice question - guide them. "
+    + (p.learningStyle ? "Preferred learning style: " + p.learningStyle + ". " : "")
+    + (p.language ? "Preferred language: " + p.language + ". " : "")
+    + (school.length ? "School evidence is provided; mention it ONLY if it genuinely relates to what they asked. " : "")
+    + (hits.length ? "" : "You have no CONTEXT for this, so do not claim to quote the syllabus or any paper. "));
+  const msgs = [{ role: "system", content: sys }];
+  (history || []).slice(-8).forEach(h => { if (h && h.role && h.content) msgs.push({ role: h.role === "assistant" ? "assistant" : "user", content: String(h.content).slice(0, 1000) }); });
+  msgs.push({ role: "user", content:
+    (hits.length ? "CONTEXT:\n" + bkContext(hits) + "\n\n" : "")
+    + (school.length ? "SCHOOL EVIDENCE (" + p.school + "):\n" + bkContext(school) + "\n\n" : "")
+    + (mems.length ? "WHAT I REMEMBER ABOUT THIS STUDENT:\n" + memoryLines(mems, 14) + "\n\n" : "")
+    + "STUDENT: " + studentLine(p) + "\n\nTHEY SAID: " + message });
+  const r = await callStandard(env, arenaCfg(cfg, bh, "students"), msgs, 1100);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  await studentLog(env, uid, { type: "chat", q: String(message).slice(0, 300) });
+  let learned = [];
+  const memJob = memoryFilter(env, cfg, bh, "student", uid, message, r.text);
+  if (!(env.__bg && env.__bg(memJob))) { try { learned = await memJob; } catch (e) {} }
+  return { ok: true, kind: "chat", text: r.text, sources: bkSources(hits.concat(school)), usedLibrary: !!hits.length, usedSchool: !!school.length, learned, nudges: proactiveNudges(p, mems) };
+}
+
+/* ECZ Time Machine: fresh original questions modelled on real papers. */
+async function studentPractice(env, cfg, p, opts) {
+  const subject = opts.subject || (p.subjects || [])[0] || "";
+  const topic = opts.topic || weakTopics(p, 1)[0] || "";
+  const grade = opts.grade || p.grade || "";
+  if (!subject || !grade) return { ok: true, kind: "clarify", message: "Which subject and grade should I set questions for?" };
+  const mode = opts.mode === "test" ? "test" : "ecz";
+  const want = Math.max(1, Math.min(10, parseInt(opts.count, 10) || 5));
+  const q = (subject + " " + grade + " " + topic + " questions").trim();
+  const found = await bucketAcrossDocs(env, q, { kind: mode, subject, form: grade }, 8, 2);
+  if (!found.chunks.length) {
+    return { ok: true, kind: "clarify", message: "I don't have " + (mode === "ecz" ? "ECZ papers" : "school tests") + " for " + subject + " " + grade + " in the library yet. Please ask your admin to add them to Bucket House." };
+  }
+  const sys = "You are Zama, an examiner-style question writer for Zambia. Study the CONTEXT: real " + (mode === "ecz" ? "ECZ examination" : "school test") + " material. "
+    + "Learn its wording, structure, difficulty and mark allocation, then write NEW original questions in the same style. "
+    + "Never copy a question from the CONTEXT word for word. "
+    + "Reply with ONLY a JSON array, no prose, no code fences: "
+    + '[{"q":"question text","marks":3,"topic":"topic name","answer":"full worked answer","tip":"one short hint"}]';
+  const usr = "CONTEXT:\n" + bkContext(found.chunks) + "\n\nSTUDENT: " + studentLine(p)
+    + "\n\nWrite " + want + " new questions for " + subject + " " + grade + (topic ? " on " + topic : "") + ".";
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 1800);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  let arr = parseJsonLoose(r.text);
+  if (arr && !Array.isArray(arr) && Array.isArray(arr.questions)) arr = arr.questions;
+  if (!Array.isArray(arr) || !arr.length) return { ok: true, kind: "text", text: r.text, sources: bkSources(found.chunks) };
+  const questions = arr.slice(0, want).map((x, i) => ({
+    n: i + 1,
+    q: String(x.q || x.question || "").slice(0, 900),
+    marks: parseInt(x.marks, 10) || 2,
+    topic: String(x.topic || topic || subject).slice(0, 80),
+    answer: String(x.answer || "").slice(0, 1600),
+    tip: String(x.tip || "").slice(0, 300)
+  })).filter(x => x.q);
+  return { ok: true, kind: "practice", subject, grade, mode, questions, studied: found.docs, sources: bkSources(found.chunks) };
+}
+
+/* Marking + mastery update. */
+async function studentMark(env, cfg, uid, p, items) {
+  const list = (items || []).slice(0, 10).filter(x => x && x.q);
+  if (!list.length) return { ok: false, error: "nothing to mark" };
+  const sys = "You are a fair Zambian examiner. Mark each answer out of its marks. Be encouraging but honest. "
+    + "Reply with ONLY a JSON array, no prose: "
+    + '[{"n":1,"score":2,"outOf":3,"feedback":"what was right/wrong","fix":"the one thing to revise"}]';
+  const usr = list.map(x => "Q" + x.n + " (" + (x.marks || 2) + " marks) [topic: " + (x.topic || "") + "]\nQuestion: " + x.q + "\nModel answer: " + (x.answer || "(none)") + "\nStudent answer: " + (x.given || "(blank)")).join("\n\n");
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 1400);
+  if (!r.ok) return { ok: false, error: r.error || "marking failed" };
+  let arr = parseJsonLoose(r.text);
+  if (arr && !Array.isArray(arr) && Array.isArray(arr.results)) arr = arr.results;
+  if (!Array.isArray(arr)) return { ok: true, kind: "text", text: r.text };
+  let total = 0, out = 0;
+  const results = arr.slice(0, list.length).map(x => {
+    const n = parseInt(x.n, 10) || 1;
+    const src = list.find(i => i.n === n) || list[0];
+    const outOf = parseInt(x.outOf, 10) || (src.marks || 2);
+    const score = Math.max(0, Math.min(outOf, parseInt(x.score, 10) || 0));
+    total += score; out += outOf;
+    updateMastery(p, src.subject || "", src.topic || "", outOf ? score / outOf : 0);
+    return { n, score, outOf, feedback: String(x.feedback || "").slice(0, 600), fix: String(x.fix || "").slice(0, 300), topic: src.topic || "" };
+  });
+  await fbUpdate(env, "students/" + uid + "/profile", { mastery: p.mastery, updatedAt: nowMs() });
+  await studentLog(env, uid, { type: "marked", score: total, outOf: out });
+  const pct = out ? Math.round((total / out) * 100) : 0;
+  return { ok: true, kind: "marked", total, outOf: out, percent: pct, results, weak: weakTopics(p, 3), readiness: readiness(p) };
+}
+
+/* Roadmap / PSCE: what to study next, driven by exam date + weaknesses. */
+async function studentRoadmap(env, cfg, uid, p) {
+  if (!p.grade || !(p.subjects || []).length) return { ok: true, kind: "clarify", message: "Tell me your grade and the subjects you are studying, then I'll build your plan." };
+  const days = daysToExam(p);
+  const subj = (p.subjects || []).slice(0, 5).join(", ");
+  const found = await bucketAcrossDocs(env, subj + " " + p.grade + " syllabus topics", { kind: "curriculum", form: p.grade }, 6, 2);
+  const weak = weakTopics(p, 5), due = dueTopics(p, 5).map(x => x.topic);
+  const sys = "You are Zama, planning a Zambian student's study roadmap. "
+    + (found.chunks.length ? "Use the CONTEXT (official syllabus) for topic names; never invent topics. " : "Keep to well-known syllabus topics; do not claim to quote the syllabus. ")
+    + "Be realistic about the time available. Reply in clean markdown: ## This week, ## Next 4 weeks, ## Daily routine. Keep it short and doable.";
+  const usr = (found.chunks.length ? "CONTEXT:\n" + bkContext(found.chunks) + "\n\n" : "")
+    + "STUDENT: " + studentLine(p)
+    + (days !== null ? "\nDays until exam: " + days : "")
+    + (p.studyMinutes ? "\nStudy time available: about " + p.studyMinutes + " minutes a day" : "")
+    + (weak.length ? "\nWeakest topics: " + weak.join(", ") : "")
+    + (due.length ? "\nDue for revision now: " + due.join(", ") : "")
+    + "\n\nBuild the study plan.";
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 1500);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  await fbSet(env, "students/" + uid + "/roadmap", { text: r.text, at: nowMs(), daysToExam: days });
+  await studentLog(env, uid, { type: "roadmap" });
+  return { ok: true, kind: "roadmap", text: r.text, daysToExam: days, weak, due, readiness: readiness(p), sources: bkSources(found.chunks) };
+}
+
+/* Progress report for the student, a parent or a teacher. */
+async function studentReport(env, cfg, uid, p, audience) {
+  const rd = readiness(p);
+  const weak = weakTopics(p, 5);
+  const strong = Object.values(p.mastery || {}).sort((a, b) => (b.m || 0) - (a.m || 0)).slice(0, 3).map(x => x.topic);
+  let hist = null;
+  try { hist = await fbGet(env, "students/" + uid + "/history", "orderBy=\"$key\"&limitToLast=25"); } catch (e) {}
+  const n = hist ? Object.keys(hist).length : 0;
+  const who = audience === "parent" ? "a parent (simple, warm, no jargon)" : audience === "teacher" ? "a teacher (specific and practical)" : "the student";
+  const sys = "You are Zama, writing a short honest progress report for " + who + ". "
+    + "Use ONLY the figures given. Do not exaggerate or promise exam results. 120-180 words, clean markdown.";
+  const usr = "STUDENT: " + studentLine(p)
+    + "\nTopics tracked: " + (rd ? rd.topics : 0)
+    + (rd ? "\nAverage mastery: " + rd.score + "%" : "")
+    + (strong.length ? "\nStrongest: " + strong.join(", ") : "")
+    + (weak.length ? "\nNeeds work: " + weak.join(", ") : "")
+    + "\nRecent activities logged: " + n
+    + (daysToExam(p) !== null ? "\nDays to exam: " + daysToExam(p) : "");
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: usr }], 900);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  return { ok: true, kind: "report", text: r.text, readiness: rd, weak, strong, activities: n };
+}
+
+/* ============================================================
+   BUCKET HOUSE CONTROL LAYER
+   One editable store (Firebase node "bucketConfig") holding the master
+   system prompt, per-arena models, every usage cap, the token plan and
+   the dock skills. Kept OUT of "config" so the Panel's full-overwrite
+   save can never wipe it.
+   ============================================================ */
+const NO_EVIDENCE = "I don't currently have verified information about that inside my Bucket House.";
+const BH_MASTER_PROMPT =
+  "You are Zama, an experienced Zambian educator with long-term memory. "
+  + "Ground every factual claim about curriculum, papers, schools or reports on the CONTEXT provided. "
+  + "Never invent facts, statistics or syllabus content. If the CONTEXT does not cover it, say: \"" + NO_EVIDENCE + "\" "
+  + "Be warm, clear and practical. Use the learner's own words and level.";
+const BH_CAP_DEFS = {
+  lesson: { label: "Lesson plans", free: 5, paid: 50 },
+  study: { label: "Study sessions", free: 15, paid: 150 },
+  message: { label: "Messages", free: 60, paid: 600 },
+  image: { label: "Images", free: 5, paid: 50 },
+  document: { label: "Documents", free: 3, paid: 30 },
+  assessment: { label: "Assessments", free: 3, paid: 30 },
+  mock: { label: "Mock exams", free: 1, paid: 10 },
+  essay: { label: "Essays", free: 2, paid: 20 },
+  revision: { label: "Revision packs", free: 3, paid: 30 },
+  fileGen: { label: "File generation", free: 3, paid: 30 },
+  exportDoc: { label: "Exports", free: 3, paid: 30 }
+};
+function bhDefaults() {
+  const caps = {};
+  Object.keys(BH_CAP_DEFS).forEach(k => { caps[k] = { enabled: true, free: BH_CAP_DEFS[k].free, paid: BH_CAP_DEFS[k].paid, warnAt: 2, label: BH_CAP_DEFS[k].label, offMessage: "", limitMessage: "" }; });
+  return {
+    systemPrompt: BH_MASTER_PROMPT,
+    adminUnlimited: true,
+    caps,
+    arenas: { students: { enabled: true, provider: "", model: "" }, teachers: { enabled: true, provider: "", model: "" } },
+    tokens: { enabled: false, weekly: 450000, daily: 500, perRequest: 50, resetHour: 0, resetMinute: 0, resetSecond: 0, tzOffsetMinutes: 120 },
+    skills: {},
+    // legacy keys kept so older clients keep working
+    lessonsEnabled: true, lessonDailyFree: 5, lessonDailyPaid: 50, lessonWarnAt: 2,
+    studentsEnabled: true, studyDailyFree: 15, studyDailyPaid: 150,
+    offMessage: "Lesson planning is turned off right now. Please try again later.",
+    limitMessage: "You've used all your lesson plans for today.",
+    studyOffMessage: "Study mode is turned off right now. Please try again later.",
+    studyLimitMessage: "You've used all your study sessions for today."
+  };
+}
+let _bhCache = { at: 0, v: null };
+async function bhConfig(env, fresh) {
+  if (!fresh && _bhCache.v && (nowMs() - _bhCache.at) < 20000) return _bhCache.v;
+  let saved = null;
+  try { saved = await fbGet(env, "bucketConfig"); } catch (e) {}
+  const d = bhDefaults();
+  const out = Object.assign({}, d, saved || {});
+  out.caps = Object.assign({}, d.caps, (saved && saved.caps) || {});
+  Object.keys(d.caps).forEach(k => { out.caps[k] = Object.assign({}, d.caps[k], out.caps[k] || {}); });
+  out.arenas = Object.assign({}, d.arenas, (saved && saved.arenas) || {});
+  out.tokens = Object.assign({}, d.tokens, (saved && saved.tokens) || {});
+  out.skills = (saved && saved.skills) || {};
+  // legacy -> caps bridge (so old Bucket House saves still control lessons/study)
+  if (saved) {
+    if (saved.lessonDailyFree !== undefined) out.caps.lesson.free = parseInt(saved.lessonDailyFree, 10);
+    if (saved.lessonDailyPaid !== undefined) out.caps.lesson.paid = parseInt(saved.lessonDailyPaid, 10);
+    if (saved.lessonsEnabled !== undefined) out.caps.lesson.enabled = saved.lessonsEnabled !== false;
+    if (saved.lessonWarnAt !== undefined) out.caps.lesson.warnAt = parseInt(saved.lessonWarnAt, 10);
+    if (saved.limitMessage) out.caps.lesson.limitMessage = saved.limitMessage;
+    if (saved.offMessage) out.caps.lesson.offMessage = saved.offMessage;
+    if (saved.studyDailyFree !== undefined) out.caps.study.free = parseInt(saved.studyDailyFree, 10);
+    if (saved.studyDailyPaid !== undefined) out.caps.study.paid = parseInt(saved.studyDailyPaid, 10);
+    if (saved.studentsEnabled !== undefined) out.caps.study.enabled = saved.studentsEnabled !== false;
+    if (saved.studyLimitMessage) out.caps.study.limitMessage = saved.studyLimitMessage;
+    if (saved.studyOffMessage) out.caps.study.offMessage = saved.studyOffMessage;
+  }
+  Object.keys(out.caps).forEach(k => {
+    const c = out.caps[k];
+    ["free", "paid", "warnAt"].forEach(f => { const n = parseInt(c[f], 10); c[f] = isNaN(n) ? 0 : Math.max(0, n); });
+    c.enabled = c.enabled !== false;
+  });
+  _bhCache = { at: nowMs(), v: out };
+  return out;
+}
+async function bhSave(env, patch) {
+  const cur = await bhConfig(env, true);
+  const next = Object.assign({}, cur, patch || {});
+  if (patch && patch.caps) { next.caps = Object.assign({}, cur.caps); Object.keys(patch.caps).forEach(k => { next.caps[k] = Object.assign({}, cur.caps[k] || {}, patch.caps[k] || {}); }); }
+  if (patch && patch.arenas) next.arenas = Object.assign({}, cur.arenas, patch.arenas);
+  if (patch && patch.tokens) next.tokens = Object.assign({}, cur.tokens, patch.tokens);
+  await fbSet(env, "bucketConfig", next);
+  _bhCache = { at: nowMs(), v: next };
+  return next;
+}
+// kept for older call sites
+async function bucketLimits(env) { return await bhConfig(env); }
+
+/* ---- #18 per-arena model choice (uses the keys already configured) ---- */
+function arenaCfg(cfg, bh, arena) {
+  const a = (bh.arenas && bh.arenas[arena]) || {};
+  if (!a.provider && !a.model) return cfg;
+  const c = Object.assign({}, cfg);
+  if (a.provider) {
+    const rest = (cfg.providerOrder || DEFAULT_CONFIG.providerOrder).filter(p => p !== a.provider);
+    c.providerOrder = [a.provider].concat(rest);
+    if (a.model) { c.providerModels = Object.assign({}, cfg.providerModels || {}); c.providerModels[a.provider] = [a.model]; }
+  }
+  return c;
+}
+function bhPrompt(bh, extra) {
+  return (bh.systemPrompt || BH_MASTER_PROMPT) + (extra ? " " + extra : "");
+}
+
+/* ---- #12 fully configurable caps, no hardcoded values ---- */
+function isAdminUnlimited(bh, isAdmin) { return isAdmin && bh.adminUnlimited !== false; }
+function capGate(u, bh, isAdmin, capName) {
+  const c = (bh.caps && bh.caps[capName]) || null;
+  if (!c) return { blocked: false, left: Infinity, cap: 0 };
+  if (isAdminUnlimited(bh, isAdmin)) return { blocked: false, left: Infinity, cap: 0 };
+  if (!c.enabled) return { blocked: true, message: c.offMessage || ((c.label || "This feature") + " is turned off right now."), left: 0, cap: 0 };
+  const cap = (u.plan === "paid") ? c.paid : c.free;
+  if (!cap || cap <= 0) return { blocked: false, left: Infinity, cap: 0 };
+  u.caps = u.caps && typeof u.caps === "object" ? u.caps : {};
+  const slot = u.caps[capName] && u.caps[capName].day === dayKey() ? u.caps[capName] : { day: dayKey(), n: 0 };
+  u.caps[capName] = slot;
+  const left = Math.max(0, cap - (slot.n || 0));
+  if (left <= 0) return { blocked: true, message: (c.limitMessage || ("You've used all your " + (c.label || "requests").toLowerCase() + " for today.")) + " Resets in " + fmtReset(hoursToMidnightUTC()) + ".", left: 0, cap };
+  return { blocked: false, left, cap, warnAt: c.warnAt || 0 };
+}
+function capCharge(u, capName) {
+  u.caps = u.caps && typeof u.caps === "object" ? u.caps : {};
+  const slot = u.caps[capName] && u.caps[capName].day === dayKey() ? u.caps[capName] : { day: dayKey(), n: 0 };
+  slot.n = (slot.n || 0) + 1;
+  u.caps[capName] = slot;
+}
+
+/* ---- #14 advanced token management (daily allowance drawn from a weekly pool) ---- */
+function tzNow(tp) { return new Date(nowMs() + (parseInt(tp.tzOffsetMinutes, 10) || 0) * 60000); }
+function tzDayKey(tp) {
+  const d = tzNow(tp);
+  const secs = d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
+  const boundary = (parseInt(tp.resetHour, 10) || 0) * 3600 + (parseInt(tp.resetMinute, 10) || 0) * 60 + (parseInt(tp.resetSecond, 10) || 0);
+  const shifted = new Date(d.getTime() - (secs < boundary ? 86400000 : 0));
+  return shifted.toISOString().slice(0, 10);
+}
+function tzWeekKey(tp) {
+  const dk = tzDayKey(tp);
+  const d = new Date(dk + "T00:00:00Z");
+  const day = d.getUTCDay();
+  const monday = new Date(d.getTime() - ((day + 6) % 7) * 86400000);
+  return monday.toISOString().slice(0, 10);
+}
+function secondsToNextReset(tp) {
+  const d = tzNow(tp);
+  const secs = d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
+  const boundary = (parseInt(tp.resetHour, 10) || 0) * 3600 + (parseInt(tp.resetMinute, 10) || 0) * 60 + (parseInt(tp.resetSecond, 10) || 0);
+  return secs < boundary ? (boundary - secs) : (86400 - secs + boundary);
+}
+function tokenState(u, bh) {
+  const tp = bh.tokens || {};
+  if (!tp.enabled) return { enabled: false };
+  const wk = tzWeekKey(tp), dk = tzDayKey(tp);
+  const weekly = Math.max(0, parseInt(tp.weekly, 10) || 0);
+  const daily = Math.max(0, parseInt(tp.daily, 10) || 0);
+  if (u.tokWeek !== wk) { u.tokWeek = wk; u.tokWeekLeft = weekly; u.tokDay = ""; }
+  if (u.tokWeekLeft === undefined || u.tokWeekLeft === null) u.tokWeekLeft = weekly;
+  if (u.tokDay !== dk) {
+    const grant = Math.min(daily, Math.max(0, u.tokWeekLeft));
+    u.tokDay = dk; u.tokDayLeft = grant; u.tokWeekLeft = Math.max(0, u.tokWeekLeft - grant);
+  }
+  if (u.tokDayLeft === undefined || u.tokDayLeft === null) u.tokDayLeft = 0;
+  return {
+    enabled: true, weekKey: wk, dayKey: dk,
+    dailyAllowance: daily, weeklyAllowance: weekly,
+    dailyLeft: u.tokDayLeft, weeklyLeft: u.tokWeekLeft,
+    perRequest: Math.max(1, parseInt(tp.perRequest, 10) || 1),
+    resetInSeconds: secondsToNextReset(tp)
+  };
+}
+function tokenSpend(u, bh, units) {
+  const st = tokenState(u, bh);
+  if (!st.enabled) return { ok: true };
+  const cost = (units || 1) * st.perRequest;
+  if (u.tokDayLeft < cost) {
+    const more = u.tokWeekLeft > 0;
+    return { ok: false, message: more
+      ? "You've used today's tokens. Your next daily allowance unlocks in " + fmtReset(st.resetInSeconds / 3600) + "."
+      : "Your weekly token balance is finished. It refills at the start of next week." };
+  }
+  u.tokDayLeft -= cost;
+  return { ok: true, spent: cost, dailyLeft: u.tokDayLeft, weeklyLeft: u.tokWeekLeft };
+}
+
+/* ---- #13 membership: grant paid by UID, email or username (no DB rule changes) ---- */
+function idKey(s) { return String(s || "").toLowerCase().trim().replace(/[.#$/\[\]\s]/g, "_").slice(0, 120); }
+async function indexUser(env, uid, email, username) {
+  try {
+    if (email) await fbSet(env, "emailIndex/" + idKey(email), uid);
+    if (username) await fbSet(env, "nameIndex/" + idKey(username), uid);
+  } catch (e) {}
+}
+async function resolveUid(env, ident) {
+  const id = String(ident || "").trim();
+  if (!id) return null;
+  if (/^[A-Za-z0-9]{20,}$/.test(id)) return id;                       // looks like a UID
+  if (id.indexOf("@") > -1) { try { return await fbGet(env, "emailIndex/" + idKey(id)); } catch (e) { return null; } }
+  try { return await fbGet(env, "nameIndex/" + idKey(id)); } catch (e) { return null; }
+}
+async function setMembership(env, targetUid, plan, days) {
+  const patch = { plan: plan === "paid" ? "paid" : "free" };
+  if (plan === "paid") patch.paidUntil = nowMs() + Math.max(1, parseInt(days, 10) || 30) * 86400000;
+  else patch.paidUntil = 0;
+  await fbUpdate(env, "users/" + targetUid, patch);
+  return patch;
+}
+
+/* ============================================================
+   #2 / #3  LONG-TERM MEMORY  +  INTELLIGENT MEMORY FILTER
+   An If/Then engine decides what is worth keeping forever.
+   ============================================================ */
+const MEM_MAX = 140;
+function memPath(role, uid) { return (role === "teacher" ? "teachers/" : "students/") + uid + "/memory"; }
+async function memoryLoad(env, role, uid) {
+  let m = null;
+  try { m = await fbGet(env, memPath(role, uid)); } catch (e) {}
+  if (!m) return [];
+  return Object.keys(m).map(k => Object.assign({ id: k }, m[k])).sort((a, b) => (b.at || 0) - (a.at || 0));
+}
+function memoryLines(mems, n) {
+  return (mems || []).slice(0, n || 14).map(x => "- " + (x.k ? x.k + ": " : "") + x.v).join("\n");
+}
+// Deterministic pre-filter: obvious throwaway chatter never reaches the model.
+function memoryWorthChecking(text) {
+  const t = bkNorm(text);
+  if (t.length < 12) return false;
+  if (/^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|bye|good (morning|afternoon|evening))\b/.test(t)) return false;
+  return true;
+}
+async function memoryFilter(env, cfg, bh, role, uid, userText, aiText) {
+  if (!memoryWorthChecking(userText)) return [];
+  const sys = "You decide what an AI tutor should remember FOREVER about this "
+    + (role === "teacher" ? "teacher" : "student") + ". "
+    + "Keep only durable facts that change future teaching: goals, weaknesses, strengths, results, preferences, school, subjects, repeated mistakes, achievements. "
+    + "Ignore small talk, one-off questions and anything temporary. "
+    + 'Reply ONLY with a JSON array (empty if nothing is worth keeping): [{"k":"short label","v":"the fact in one short sentence"}]';
+  const r = await callStandard(env, arenaCfg(cfg, bh, role === "teacher" ? "teachers" : "students"),
+    [{ role: "system", content: sys }, { role: "user", content: "THEY SAID:\n" + String(userText).slice(0, 1200) + "\n\nZAMA REPLIED:\n" + String(aiText || "").slice(0, 800) }], 300);
+  if (!r.ok) return [];
+  let arr = parseJsonLoose(r.text);
+  if (arr && !Array.isArray(arr) && Array.isArray(arr.items)) arr = arr.items;
+  if (!Array.isArray(arr) || !arr.length) return [];
+  const existing = await memoryLoad(env, role, uid);
+  const have = {}; existing.forEach(x => { have[bkNorm(x.k) + "|" + bkNorm(x.v).slice(0, 40)] = x.id; });
+  const saved = [];
+  for (const it of arr.slice(0, 4)) {
+    const k = String(it.k || "").slice(0, 60), v = String(it.v || "").slice(0, 240);
+    if (!v) continue;
+    const sig = bkNorm(k) + "|" + bkNorm(v).slice(0, 40);
+    if (have[sig]) continue;
+    try { await fbPush(env, memPath(role, uid), { k, v, at: nowMs() }); saved.push({ k, v }); } catch (e) {}
+  }
+  // trim the oldest so memory never becomes clutter
+  if (existing.length + saved.length > MEM_MAX) {
+    const drop = existing.slice(MEM_MAX - saved.length);
+    for (const d of drop) { try { await fbDelete(env, memPath(role, uid) + "/" + d.id); } catch (e) {} }
+  }
+  return saved;
+}
+/* #3 proactive memory - computed from real data, never guessed */
+function proactiveNudges(p, mems) {
+  const out = [];
+  const t = nowMs();
+  const due = dueTopics(p, 3);
+  due.forEach(d => {
+    const days = Math.max(1, Math.round((t - (d.at || t)) / 86400000));
+    out.push("You haven't revised " + d.topic + " in " + days + " day" + (days === 1 ? "" : "s") + ". Shall we practise it?");
+  });
+  const weak = Object.values(p.mastery || {}).filter(x => x && typeof x.m === "number" && x.m < 0.45).slice(0, 2);
+  weak.forEach(w => { if (!out.some(o => o.indexOf(w.topic) > -1)) out.push("You previously struggled with " + w.topic + ". Would you like another practice test?"); });
+  if (p.examDate) {
+    const d = daysToExam(p);
+    if (d !== null && d <= 30) out.push("Your exam is in " + d + " day" + (d === 1 ? "" : "s") + ". Want me to tighten your study plan?");
+  }
+  return out.slice(0, 3);
+}
+
+/* ============================================================
+   #1 / #11  ONBOARDING - one question at a time, then permanent
+   ============================================================ */
+const ONBOARD_STUDENT = [
+  { k: "name", q: "Before we start, what should I call you?" },
+  { k: "school", q: "Which school do you attend?" },
+  { k: "grade", q: "Which grade or form are you in?" },
+  { k: "lessonsCovered", q: "Which topics have you already covered this term?" },
+  { k: "lessonsCurrent", q: "Which topic are you learning right now?" },
+  { k: "language", q: "Which language do you prefer to learn in?" },
+  { k: "examBoard", q: "Which examination board do you write? (For example ECZ)" },
+  { k: "goals", q: "What are your academic goals?" },
+  { k: "hardSubjects", q: "Which subjects do you find difficult?" },
+  { k: "likedSubjects", q: "Which subjects do you enjoy most?" },
+  { k: "learningStyle", q: "How do you learn best - teacher explanation, step-by-step, practice-first, or visual?" },
+  { k: "about", q: "Lastly, tell me a little about yourself." }
+];
+const ONBOARD_TEACHER = [
+  { k: "name", q: "Before we start, what should I call you?" },
+  { k: "school", q: "Which school do you teach at?" },
+  { k: "forms", q: "Which grade(s) or form(s) do you teach?" },
+  { k: "subjects", q: "Which subject(s) do you teach?" },
+  { k: "classes", q: "How many classes do you teach?" },
+  { k: "learners", q: "About how many learners do you have in total?" },
+  { k: "lessonsCovered", q: "Which topics have you already covered this term?" },
+  { k: "currentLessons", q: "Which topic are you teaching at the moment?" },
+  { k: "instructions", q: "Any teaching preferences I should always follow? (For example: keep lessons under 40 minutes, focus on practical activities). Say 'none' to skip." }
+];
+function onboardFields(role) { return role === "teacher" ? ONBOARD_TEACHER : ONBOARD_STUDENT; }
+function onboardFilled(p, k) {
+  const v = p ? p[k] : null;
+  if (v === undefined || v === null) return false;
+  if (Array.isArray(v)) return v.length > 0;
+  return String(v).trim().length > 0;
+}
+function onboardNext(p, role) {
+  const fields = onboardFields(role);
+  const done = fields.filter(f => onboardFilled(p, f.k)).length;
+  const next = fields.find(f => !onboardFilled(p, f.k));
+  return next
+    ? { complete: false, field: next.k, question: next.q, answered: done, total: fields.length }
+    : { complete: true, answered: done, total: fields.length };
+}
+
+/* ============================================================
+   #6 / #7  SCHOOL INTELLIGENCE - only used when real evidence exists
+   ============================================================ */
+async function schoolEvidence(env, school, subject) {
+  if (!school) return [];
+  const q = (school + " " + (subject || "") + " performance results weaknesses report").trim();
+  const all = await bucketLoadChunks(env, null);
+  if (!all.length) return [];
+  const pool = all.filter(c => (bkNorm(c.title) + " " + bkNorm(c.text)).indexOf(bkNorm(school)) > -1);
+  if (!pool.length) return [];
+  return bucketRank(pool, q, 4);
+}
+
+/* ============================================================
+   #8  PATTERN RECOGNITION - counted from real documents, never guessed
+   ============================================================ */
+const PAT_STOP = new Set(("the a an and or of to in on for with is are was were be this that these those it its into their they them then than which who whom whose will would shall can could should may might must have has had do does did not no yes if but so we you he she our your his her question questions paper papers marks mark section answer answers all any each from about using use given find state give explain describe calculate show write name list define").split(" "));
+function docFrequency(chunks) {
+  const perDoc = {};
+  chunks.forEach(c => { (perDoc[c.docId] = perDoc[c.docId] || []).push(String(c.text || "")); });
+  const docIds = Object.keys(perDoc);
+  const df = {};
+  docIds.forEach(id => {
+    const words = bkNorm(perDoc[id].join(" ")).replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length > 3 && !PAT_STOP.has(w));
+    const seen = new Set();
+    for (let i = 0; i < words.length; i++) {
+      seen.add(words[i]);
+      if (i + 1 < words.length) seen.add(words[i] + " " + words[i + 1]);
+    }
+    seen.forEach(t => { df[t] = (df[t] || 0) + 1; });
+  });
+  return { df, totalDocs: docIds.length, docIds };
+}
+async function examPatterns(env, subject, grade, kind) {
+  const found = await bucketAcrossDocs(env, (subject + " " + grade + " examination questions").trim(), { kind: kind || "ecz", subject, form: grade }, 12, 6);
+  if (!found.chunks.length) return { ok: true, totalPapers: 0, patterns: [], message: NO_EVIDENCE };
+  const { df, totalDocs } = docFrequency(found.chunks);
+  const patterns = Object.keys(df)
+    .filter(t => df[t] >= 2 && t.indexOf(" ") > -1)          // phrases seen in 2+ papers
+    .sort((a, b) => df[b] - df[a])
+    .slice(0, 12)
+    .map(t => ({ term: t, papers: df[t], of: totalDocs }));
+  return { ok: true, totalPapers: totalDocs, documents: found.docs, patterns };
+}
+
+/* ============================================================
+   #10  BUCKET HOUSE DOCK SKILLS
+   ============================================================ */
+const BH_SKILL_DEFAULTS = {
+  curriculumSearch: { label: "Curriculum Search", kind: "curriculum", instruction: "Find and quote the exact syllabus entries that answer the request." },
+  pastPaper: { label: "Past Paper Retrieval", kind: "ecz", instruction: "Find relevant past paper questions and summarise how they are asked." },
+  markingGuide: { label: "Marking Guide Analysis", kind: "ecz", instruction: "Explain how marks are awarded, step by step, using the marking guidance in the context." },
+  lessonPlanner: { label: "Lesson Planner", kind: "curriculum", instruction: "Produce a complete competence-based lesson plan grounded on the syllabus." },
+  revisionGenerator: { label: "Revision Generator", kind: "curriculum", instruction: "Produce a compact revision pack: key points, worked example, and 5 practice questions." },
+  assessmentGenerator: { label: "Assessment Generator", kind: "ecz", instruction: "Write original assessment questions in the same style and mark allocation as the context." },
+  progressAnalyzer: { label: "Student Progress Analyzer", kind: "", instruction: "Analyse the learner's mastery figures honestly and say what to do next." },
+  weaknessDetector: { label: "Weakness Detector", kind: "report", instruction: "Identify likely weak areas and the evidence behind each one." },
+  schoolIntel: { label: "School Intelligence Search", kind: "school", instruction: "Report only verified findings about the named school." },
+  eduStats: { label: "Educational Statistics", kind: "report", instruction: "Report only statistics that appear in the context, with their source." },
+  docGenerator: { label: "Document Generator", kind: "", instruction: "Produce a well-structured professional document in clean markdown." }
+};
+function bhSkills(bh) {
+  const out = {};
+  Object.keys(BH_SKILL_DEFAULTS).forEach(k => { out[k] = Object.assign({ enabled: true }, BH_SKILL_DEFAULTS[k], (bh.skills && bh.skills[k]) || {}); });
+  Object.keys(bh.skills || {}).forEach(k => { if (!out[k]) out[k] = Object.assign({ enabled: true, label: k, kind: "", instruction: "" }, bh.skills[k]); });
+  return out;
+}
+async function runSkill(env, cfg, bh, skillName, body, profileLine) {
+  const skills = bhSkills(bh);
+  const sk = skills[skillName];
+  if (!sk) return { ok: false, error: "Unknown skill." };
+  if (sk.enabled === false) return { ok: false, error: (sk.label || skillName) + " is switched off." };
+  const query = String(body.query || "").trim();
+  if (query.length < 2) return { ok: false, error: "What should I look for?" };
+  const found = await bucketAcrossDocs(env, query, { kind: sk.kind || undefined, subject: body.subject, form: body.form, school: body.school }, 8, 3);
+  const hits = found.chunks.length ? found.chunks : await bucketSmart(env, query, { subject: body.subject, form: body.form }, 6);
+  if (!hits.length) return { ok: true, kind: "empty", text: NO_EVIDENCE, sources: [] };
+  const sys = bhPrompt(bh, sk.instruction + " Use ONLY the CONTEXT. Reply in clean markdown.");
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + bkContext(hits) + (profileLine ? "\n\nUSER: " + profileLine : "") + "\n\nREQUEST: " + query }], 1600);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  return { ok: true, kind: "skill", skill: skillName, label: sk.label, text: r.text, sources: bkSources(hits), documents: found.docs };
+}
+
+/* ============================================================
+   #19  ASSESSMENT CARDS - structured so the app renders a card
+   ============================================================ */
+const ASSESS_TYPES = {
+  quiz: { label: "Quiz", count: 5, marks: 1 },
+  test: { label: "Test", count: 8, marks: 2 },
+  practice: { label: "Practice Questions", count: 5, marks: 2 },
+  assignment: { label: "Assignment", count: 5, marks: 3 },
+  mock: { label: "Mock Examination", count: 12, marks: 3 },
+  essay: { label: "Essay", count: 1, marks: 20 }
+};
+async function buildAssessment(env, cfg, bh, p, body) {
+  const type = ASSESS_TYPES[String(body.type || "practice")] ? String(body.type || "practice") : "practice";
+  const spec = ASSESS_TYPES[type];
+  const subject = body.subject || (p.subjects || [])[0] || "";
+  const grade = body.grade || p.grade || "";
+  const topic = body.topic || weakTopics(p, 1)[0] || "";
+  if (!subject || !grade) return { ok: true, kind: "clarify", message: "Which subject and grade is this " + spec.label.toLowerCase() + " for?" };
+  const count = Math.max(1, Math.min(15, parseInt(body.count, 10) || spec.count));
+  const srcKind = body.source === "test" ? "test" : "ecz";
+  const found = await bucketAcrossDocs(env, (subject + " " + grade + " " + topic).trim(), { kind: srcKind, subject, form: grade }, 8, 2);
+  if (!found.chunks.length) return { ok: true, kind: "clarify", message: NO_EVIDENCE + " Please add " + (srcKind === "ecz" ? "past papers" : "school tests") + " for " + subject + " " + grade + " to Bucket House." };
+  if (type === "essay") {
+    const sys = bhPrompt(bh, "Set ONE original essay task in the style of the CONTEXT, with a clear marking rubric. "
+      + 'Reply ONLY as JSON: {"q":"essay question","marks":20,"topic":"...","rubric":["point 1","point 2"],"tip":"planning advice"}');
+    const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + bkContext(found.chunks) + "\n\nSTUDENT: " + studentLine(p) + "\n\nSubject: " + subject + " " + grade + (topic ? ", topic: " + topic : "") }], 1200);
+    if (!r.ok) return { ok: false, error: r.error };
+    const o = parseJsonLoose(r.text) || {};
+    const q = String(o.q || "").slice(0, 900);
+    if (!q) return { ok: true, kind: "text", text: r.text };
+    return { ok: true, kind: "assessment", card: { type, label: spec.label, title: (topic || subject) + " Essay", subtitle: subject + " · " + grade, items: 1, marks: parseInt(o.marks, 10) || spec.marks },
+      questions: [{ n: 1, q, marks: parseInt(o.marks, 10) || spec.marks, topic: String(o.topic || topic || subject).slice(0, 80), rubric: Array.isArray(o.rubric) ? o.rubric.slice(0, 10).map(x => String(x).slice(0, 200)) : [], tip: String(o.tip || "").slice(0, 300), answer: "" }],
+      studied: found.docs, sources: bkSources(found.chunks) };
+  }
+  const sys = bhPrompt(bh, "Study the CONTEXT (real " + (srcKind === "ecz" ? "examination" : "school test") + " material), learn its wording, difficulty and mark allocation, then write NEW original questions in the same style. Never copy a question word for word. "
+    + 'Reply ONLY with a JSON array: [{"q":"...","marks":2,"topic":"...","answer":"full worked answer","tip":"one hint"}]');
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + bkContext(found.chunks) + "\n\nSTUDENT: " + studentLine(p) + "\n\nWrite " + count + " questions for " + subject + " " + grade + (topic ? " on " + topic : "") + "." }], 1900);
+  if (!r.ok) return { ok: false, error: r.error };
+  let arr = parseJsonLoose(r.text);
+  if (arr && !Array.isArray(arr) && Array.isArray(arr.questions)) arr = arr.questions;
+  if (!Array.isArray(arr) || !arr.length) return { ok: true, kind: "text", text: r.text, sources: bkSources(found.chunks) };
+  const questions = arr.slice(0, count).map((x, i) => ({
+    n: i + 1, q: String(x.q || x.question || "").slice(0, 900),
+    marks: parseInt(x.marks, 10) || spec.marks,
+    topic: String(x.topic || topic || subject).slice(0, 80),
+    answer: String(x.answer || "").slice(0, 1600),
+    tip: String(x.tip || "").slice(0, 300)
+  })).filter(x => x.q);
+  const totalMarks = questions.reduce((s, q) => s + (q.marks || 0), 0);
+  return { ok: true, kind: "assessment",
+    card: { type, label: spec.label, title: (topic || subject) + " " + spec.label, subtitle: subject + " · " + grade + " · " + questions.length + " questions", items: questions.length, marks: totalMarks },
+    questions, subject, grade, studied: found.docs, sources: bkSources(found.chunks) };
+}
+
+/* ============================================================
+   #20  TEACHER GUIDANCE - why learners struggle, and what to do
+   ============================================================ */
+async function teacherInsights(env, cfg, bh, p, body) {
+  const subject = body.subject || (p.subjects || [])[0] || "";
+  const form = body.form || (p.forms || [])[0] || "";
+  const topic = body.topic || "";
+  if (!subject || !form) return { ok: true, kind: "clarify", message: "Which subject and Form should I look at?" };
+  const q = (subject + " " + form + " " + topic + " common mistakes misconceptions difficulties").trim();
+  const reports = await bucketAcrossDocs(env, q, { kind: "report", subject, form }, 6, 3);
+  const school = await schoolEvidence(env, p.school, subject);
+  const hits = reports.chunks.concat(school);
+  if (!hits.length) return { ok: true, kind: "empty", text: NO_EVIDENCE };
+  const sys = bhPrompt(bh, "Advise a Zambian teacher using ONLY the CONTEXT (examiner reports, observations, school records). "
+    + "Cover: ## Why learners struggle, ## Common misconceptions, ## Teaching recommendations, ## Classroom engagement, ## Suggested interventions. "
+    + "Every claim must come from the CONTEXT. If the context is thin, say so rather than filling gaps.");
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + bkContext(hits) + "\n\nTEACHER: " + teacherLine(p) + (classSizeNote(p) ? "\n" + classSizeNote(p) : "") + "\n\nTOPIC: " + (topic || subject + " " + form) }], 1600);
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, kind: "insights", text: r.text, sources: bkSources(hits), schoolEvidence: school.length > 0 };
+}
+
+/* ============================================================
+   #22  PROFESSIONAL DOCUMENT GENERATION (print-ready HTML)
+   ============================================================ */
+function docHtml(title, subtitle, bodyMd, meta) {
+  const body = mdToHtmlSrv(bodyMd || "");
+  const m = meta || {};
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>' + escHtmlSrv(title) + '</title><style>'
+    + ':root{--ink:#12161a;--soft:#5b6570;--line:#e3e7ec;--accent:#2fa36b;--accent2:#1e6d47;}'
+    + '*{box-sizing:border-box;}body{margin:0;background:#f5f6f8;color:var(--ink);font-family:Georgia,"Times New Roman",serif;line-height:1.65;}'
+    + '.page{max-width:820px;margin:24px auto;background:#fff;padding:0 0 54px;box-shadow:0 2px 18px rgba(0,0,0,.08);}'
+    + '.band{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;padding:26px 44px;}'
+    + '.brand{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11px;letter-spacing:2.4px;text-transform:uppercase;opacity:.92;}'
+    + 'h1{margin:8px 0 4px;font-size:27px;line-height:1.25;}.sub{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:13px;opacity:.95;}'
+    + '.meta{display:flex;flex-wrap:wrap;gap:18px;padding:12px 44px;border-bottom:1px solid var(--line);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11.5px;color:var(--soft);}'
+    + '.body{padding:26px 44px 0;}'
+    + 'h3{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:17px;color:var(--accent2);margin:26px 0 8px;padding-bottom:6px;border-bottom:2px solid var(--line);}'
+    + 'h4{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:14px;margin:18px 0 6px;color:var(--ink);}'
+    + 'p{margin:10px 0;}ul{margin:10px 0;padding-left:22px;}li{margin:5px 0;}strong{color:#000;}'
+    + 'blockquote{border-left:4px solid var(--accent);background:#f3faf6;margin:14px 0;padding:10px 16px;color:#2c3a33;}'
+    + 'table{width:100%;border-collapse:collapse;margin:14px 0;font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:13.5px;}'
+    + 'th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;}th{background:#f0f4f2;color:var(--accent2);}'
+    + 'hr{border:none;border-top:1px solid var(--line);margin:22px 0;}'
+    + '.foot{margin:30px 44px 0;padding-top:14px;border-top:1px solid var(--line);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:11px;color:var(--soft);display:flex;justify-content:space-between;gap:12px;}'
+    + '@media print{body{background:#fff;}.page{box-shadow:none;margin:0;max-width:none;}@page{margin:14mm;}}'
+    + '</style></head><body><div class="page"><div class="band"><div class="brand">Zama &middot; World Of Discoveries</div><h1>' + escHtmlSrv(title) + '</h1>'
+    + (subtitle ? '<div class="sub">' + escHtmlSrv(subtitle) + '</div>' : '') + '</div>'
+    + '<div class="meta"><span>' + escHtmlSrv(m.kind || "Document") + '</span>' + (m.school ? '<span>' + escHtmlSrv(m.school) + '</span>' : '')
+    + (m.author ? '<span>' + escHtmlSrv(m.author) + '</span>' : '') + '<span>' + new Date().toISOString().slice(0, 10) + '</span></div>'
+    + '<div class="body">' + body + '</div>'
+    + '<div class="foot"><span>Generated by Zama, grounded on the Zambian curriculum.</span><span>worldofdiscoveries</span></div>'
+    + '</div></body></html>';
+}
+
+/* ============================================================
+   TIMETABLE-DRIVEN LEARNING
+   Zama never teaches randomly WHILE a timetable is on. The student
+   can update it at any time, or switch it OFF and learn freely -
+   but even then the syllabus order inside a subject is respected,
+   so nothing is skipped.
+   Stored under students/{uid}: timetable, session, progress,
+   homework, tests.
+   ============================================================ */
+const LESSON_DEFAULT_MIN = 15;
+const TICK_GRACE_MS = 90000;   // if pings stop, we only ever charge this much
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+async function timetableGet(env, uid) {
+  let t = null;
+  try { t = await fbGet(env, "students/" + uid + "/timetable"); } catch (e) {}
+  if (!t) return { exists: false, enabled: false, lessonMinutes: LESSON_DEFAULT_MIN, pace: "normal", slots: [] };
+  t.slots = Array.isArray(t.slots) ? t.slots : [];
+  t.exists = t.slots.length > 0;
+  t.enabled = t.enabled !== false;
+  t.lessonMinutes = Math.max(3, Math.min(180, parseInt(t.lessonMinutes, 10) || LESSON_DEFAULT_MIN));
+  t.pace = t.pace || "normal";
+  return t;
+}
+function cleanSlots(raw) {
+  return (Array.isArray(raw) ? raw : []).slice(0, 80).map(s => ({
+    day: Math.max(0, Math.min(6, parseInt(s.day, 10) || 0)),
+    start: /^\d{1,2}:\d{2}$/.test(String(s.start || "")) ? String(s.start) : "16:00",
+    subject: String(s.subject || "").slice(0, 60),
+    minutes: Math.max(3, Math.min(180, parseInt(s.minutes, 10) || LESSON_DEFAULT_MIN))
+  })).filter(s => s.subject);
+}
+async function timetableSave(env, uid, body) {
+  const cur = await timetableGet(env, uid);
+  const next = {
+    enabled: body.enabled === undefined ? cur.enabled : body.enabled !== false,
+    lessonMinutes: body.lessonMinutes === undefined ? cur.lessonMinutes : Math.max(3, Math.min(180, parseInt(body.lessonMinutes, 10) || LESSON_DEFAULT_MIN)),
+    pace: body.pace ? String(body.pace).slice(0, 20) : cur.pace,
+    tzOffsetMinutes: body.tzOffsetMinutes === undefined ? (cur.tzOffsetMinutes === undefined ? 120 : cur.tzOffsetMinutes) : parseInt(body.tzOffsetMinutes, 10) || 0,
+    slots: body.slots === undefined ? (cur.slots || []) : cleanSlots(body.slots),
+    updatedAt: nowMs()
+  };
+  await fbSet(env, "students/" + uid + "/timetable", next);
+  return Object.assign({ exists: next.slots.length > 0 }, next);
+}
+function minutesOfDay(hhmm) { const m = String(hhmm || "").split(":"); return (parseInt(m[0], 10) || 0) * 60 + (parseInt(m[1], 10) || 0); }
+function localNow(tt) { return new Date(nowMs() + ((tt && tt.tzOffsetMinutes !== undefined ? tt.tzOffsetMinutes : 120) * 60000)); }
+// Which lesson is due now, and what comes after it.
+function timetableNow(tt) {
+  if (!tt.enabled || !tt.slots.length) return { mode: "free" };
+  const d = localNow(tt);
+  const today = d.getUTCDay(), mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  const todays = tt.slots.filter(s => s.day === today).sort((a, b) => minutesOfDay(a.start) - minutesOfDay(b.start));
+  const current = todays.find(s => { const st = minutesOfDay(s.start); return mins >= st && mins < st + s.minutes; });
+  const upcoming = todays.find(s => minutesOfDay(s.start) > mins);
+  let nextUp = upcoming || null;
+  if (!nextUp) {
+    for (let i = 1; i <= 7 && !nextUp; i++) {
+      const dd = (today + i) % 7;
+      const list = tt.slots.filter(s => s.day === dd).sort((a, b) => minutesOfDay(a.start) - minutesOfDay(b.start));
+      if (list.length) nextUp = Object.assign({}, list[0], { dayName: DAY_NAMES[dd] });
+    }
+  } else nextUp = Object.assign({}, nextUp, { dayName: DAY_NAMES[today] });
+  return { mode: "timetable", current: current ? Object.assign({}, current, { dayName: DAY_NAMES[today] }) : null, next: nextUp };
+}
+
+/* ---- lesson timer: pauses the moment the student stops studying ---- */
+async function sessionGet(env, uid) {
+  let s = null;
+  try { s = await fbGet(env, "students/" + uid + "/session"); } catch (e) {}
+  return s || null;
+}
+function sessionTick(s, now) {
+  if (!s || !s.running) return s;
+  const t = now || nowMs();
+  const elapsed = Math.max(0, t - (s.lastTickAt || t));
+  // No heartbeat for a while means they left the lesson: pause and charge NOTHING.
+  if (elapsed > TICK_GRACE_MS) { s.running = false; s.lastTickAt = t; return s; }
+  s.remainingMs = Math.max(0, (s.remainingMs || 0) - elapsed);
+  s.lastTickAt = t;
+  if (s.remainingMs <= 0) { s.running = false; s.finishedAt = t; }
+  return s;
+}
+async function sessionSave(env, uid, s) { await fbSet(env, "students/" + uid + "/session", s); return s; }
+
+/* ---- syllabus order: never skip, never rearrange ---- */
+function progKey(subject, grade) { return (bkNorm(subject) || "general") + "__" + (bkNorm(grade) || "any"); }
+async function syllabusOrder(env, cfg, bh, subject, grade) {
+  const key = progKey(subject, grade);
+  let cached = null;
+  try { cached = await fbGet(env, "syllabusIndex/" + key); } catch (e) {}
+  if (cached && Array.isArray(cached.topics) && cached.topics.length) return cached;
+  const found = await bucketAcrossDocs(env, (subject + " " + grade + " syllabus topics order").trim(), { kind: "curriculum", subject, form: grade }, 8, 4);
+  if (!found.chunks.length) return { topics: [], empty: true };
+  const sys = bhPrompt(bh, "From the CONTEXT (official syllabus) list the topics IN THE ORDER THE SYLLABUS PRESENTS THEM, each with its sub-topics. "
+    + "Do not invent, merge or reorder topics. "
+    + 'Reply ONLY as JSON: [{"topic":"...","subtopics":["...","..."]}]');
+  const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: "CONTEXT:\n" + bkContext(found.chunks) + "\n\nSubject: " + subject + ", " + grade }], 1500);
+  if (!r.ok) return { topics: [], empty: true };
+  let arr = parseJsonLoose(r.text);
+  if (arr && !Array.isArray(arr) && Array.isArray(arr.topics)) arr = arr.topics;
+  if (!Array.isArray(arr) || !arr.length) return { topics: [], empty: true };
+  const topics = arr.slice(0, 60).map(x => ({
+    topic: String(x.topic || "").slice(0, 120),
+    subtopics: Array.isArray(x.subtopics) ? x.subtopics.slice(0, 20).map(s => String(s).slice(0, 120)) : []
+  })).filter(x => x.topic);
+  const out = { subject, grade, topics, sources: found.docs, at: nowMs() };
+  await fbSet(env, "syllabusIndex/" + key, out);
+  return out;
+}
+async function progressGet(env, uid, subject, grade) {
+  let p = null;
+  try { p = await fbGet(env, "students/" + uid + "/progress/" + progKey(subject, grade)); } catch (e) {}
+  return p || { subject, grade, topicIndex: 0, subIndex: 0, completedSubs: [], notes: [], examplesDone: 0, exercisesDone: 0, timeMs: 0, lastAt: 0 };
+}
+async function progressSave(env, uid, subject, grade, p) {
+  await fbSet(env, "students/" + uid + "/progress/" + progKey(subject, grade), Object.assign({ subject, grade, updatedAt: nowMs() }, p));
+  return p;
+}
+// Where the student is right now, strictly in syllabus order.
+function placeInSyllabus(order, prog) {
+  const topics = (order && order.topics) || [];
+  if (!topics.length) return null;
+  const ti = Math.min(prog.topicIndex || 0, topics.length - 1);
+  const t = topics[ti];
+  const subs = t.subtopics && t.subtopics.length ? t.subtopics : [t.topic];
+  const si = Math.min(prog.subIndex || 0, subs.length - 1);
+  return {
+    topic: t.topic, subtopic: subs[si],
+    topicIndex: ti, subIndex: si,
+    isFirstEver: (prog.topicIndex || 0) === 0 && (prog.subIndex || 0) === 0 && !(prog.completedSubs || []).length,
+    previous: (prog.completedSubs || []).slice(-1)[0] || null,
+    remainingInTopic: Math.max(0, subs.length - si - 1),
+    totalTopics: topics.length
+  };
+}
+function advancePlace(order, prog) {
+  const topics = (order && order.topics) || [];
+  if (!topics.length) return prog;
+  const ti = Math.min(prog.topicIndex || 0, topics.length - 1);
+  const subs = topics[ti].subtopics && topics[ti].subtopics.length ? topics[ti].subtopics : [topics[ti].topic];
+  const si = prog.subIndex || 0;
+  const done = subs[Math.min(si, subs.length - 1)];
+  prog.completedSubs = (prog.completedSubs || []).concat([done]).slice(-300);
+  if (si + 1 < subs.length) prog.subIndex = si + 1;
+  else if (ti + 1 < topics.length) { prog.topicIndex = ti + 1; prog.subIndex = 0; }
+  else { prog.subIndex = subs.length - 1; prog.finished = true; }
+  return prog;
+}
+
+/* ---- homework: never disappears until submitted or rescheduled ---- */
+async function homeworkList(env, uid) {
+  let h = null;
+  try { h = await fbGet(env, "students/" + uid + "/homework"); } catch (e) {}
+  if (!h) return [];
+  return Object.keys(h).map(k => Object.assign({ id: k }, h[k])).sort((a, b) => (a.givenAt || 0) - (b.givenAt || 0));
+}
+function pendingHomework(list) { return (list || []).filter(x => x && x.status !== "submitted" && x.status !== "cancelled"); }
+async function homeworkGive(env, uid, item) {
+  const rec = { subject: String(item.subject || "").slice(0, 60), topic: String(item.topic || "").slice(0, 120), task: String(item.task || "").slice(0, 2000), givenAt: nowMs(), status: "pending" };
+  const r = await fbPush(env, "students/" + uid + "/homework", rec);
+  return Object.assign({ id: (r && (r.name || r.id)) || "" }, rec);
+}
+
+/* ---- one teaching step: revise first, then teach deeply ---- */
+async function teachStep(env, cfg, bh, uid, p, subject, grade, opts) {
+  const order = await syllabusOrder(env, cfg, bh, subject, grade);
+  if (!order.topics || !order.topics.length) {
+    return { ok: true, kind: "empty", message: NO_EVIDENCE + " Please add the " + subject + " syllabus for " + grade + " to Bucket House so I can teach it in order." };
+  }
+  const prog = await progressGet(env, uid, subject, grade);
+  const place = placeInSyllabus(order, prog);
+  const hw = pendingHomework(await homeworkList(env, uid));
+  const found = await bucketAcrossDocs(env, (subject + " " + grade + " " + place.topic + " " + place.subtopic).trim(), { kind: "curriculum", subject, form: grade }, 5, 3);
+  const ctx = found.chunks.length ? bkContext(found.chunks) : "";
+  const pace = (opts && opts.pace) || "normal";
+  const sys = bhPrompt(bh,
+    "SCOPE: Zama for Students - teach like a patient, experienced classroom teacher. "
+    + "Teach ONLY this sub-topic; never skip ahead or rearrange the syllabus. "
+    + (place.previous ? "Start with RETRIEVAL PRACTICE: 2 short questions on the previous lesson (" + place.previous + "), then teach. " : "Start by introducing the topic warmly. ")
+    + "Structure your reply in clean markdown with these sections: "
+    + (place.previous ? "## Quick review\n" : "") + "## What this is\n## Why it matters\n## Notes\n## Worked example\n## Your turn\n"
+    + "Use simple language and familiar Zambian examples. End '## Your turn' with 2-3 questions that check understanding. "
+    + "Never give the answers to those questions. Teaching pace: " + pace + ". "
+    + (ctx ? "Ground the content on the CONTEXT." : "Do not claim to quote the syllabus."));
+  const usr = (ctx ? "CONTEXT:\n" + ctx + "\n\n" : "")
+    + "STUDENT: " + studentLine(p)
+    + "\nSUBJECT: " + subject + " (" + grade + ")"
+    + "\nTOPIC: " + place.topic + "\nSUB-TOPIC: " + place.subtopic
+    + (place.previous ? "\nPREVIOUS LESSON: " + place.previous : "")
+    + (hw.length ? "\nPENDING HOMEWORK: " + hw.map(x => x.subject + " - " + x.topic).join("; ") : "")
+    + "\n\nTeach this sub-topic now.";
+  const r = await callStandard(env, arenaCfg(cfg, bh, "students"), [{ role: "system", content: sys }, { role: "user", content: usr }], 1900);
+  if (!r.ok) return { ok: false, error: r.error || "generation failed" };
+  prog.lastAt = nowMs();
+  prog.notes = (prog.notes || []).concat([place.subtopic]).slice(-200);
+  await progressSave(env, uid, subject, grade, prog);
+  await studentLog(env, uid, { type: "lesson", subject, topic: place.topic, sub: place.subtopic });
+  return {
+    ok: true, kind: "lesson", subject, grade,
+    topic: place.topic, subtopic: place.subtopic,
+    position: { topic: place.topicIndex + 1, of: place.totalTopics, remainingInTopic: place.remainingInTopic },
+    previous: place.previous, text: r.text,
+    pendingHomework: hw.map(x => ({ id: x.id, subject: x.subject, topic: x.topic, task: x.task })),
+    sources: bkSources(found.chunks)
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return json({ ok: true });
@@ -4848,6 +6119,13 @@ export default {
 
     if (request.method === "GET" && path === "/health") {
       return json({ ok: true, service: "World Of Discoveries AI Worker", at: nowMs() });
+    }
+    if (request.method === "GET" && path === "/share") {
+      const sid = url.searchParams.get("id") || "";
+      let rec = null;
+      try { rec = sid ? await fbGet(env, "shared/" + sid) : null; } catch (e) {}
+      if (!rec || !rec.plan) return new Response("This lesson plan link is not available.", { status: 404, headers: { "Content-Type": "text/plain" } });
+      return new Response(docHtml(rec.title || "Lesson plan", rec.subtitle || "", rec.plan, { kind: rec.kind || "Lesson plan" }), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
     if (request.method !== "POST") return json({ error: "POST only" }, 405);
 
@@ -4867,6 +6145,11 @@ export default {
       // the user should never wait on a Firebase save to see their answer.
       env.__bg = (p) => { try { if (ctx && ctx.waitUntil) { ctx.waitUntil(Promise.resolve(p).catch(() => {})); return true; } } catch (e) {} return false; };
       if (ctx && ctx.waitUntil) ctx.waitUntil(cleanupUserData(env, cfg, uid, u));
+      // #13: index email/username once so admins can grant Paid by email.
+      if (!u.emailIndexed && (email || u.username)) {
+        u.emailIndexed = true;
+        if (!env.__bg(indexUser(env, uid, email, u.username))) { try { await indexUser(env, uid, email, u.username); } catch (e) {} }
+      }
 
       switch (path) {
         case "/chat": return await handleChat(env, cfg, uid, u, body, email);
@@ -4899,12 +6182,19 @@ export default {
           const q = String(body.query || "").trim();
           if (q.length < 3) return json(friendly("Ask something first."), 400);
           const bkAdmin = uid === ADMIN_UID;
+          const bkLim = await bucketLimits(env);
+          const bkGateRes = bucketGate(u, bkLim, bkAdmin);
+          if (bkGateRes.blocked) {
+            await saveUser(env, uid, u);
+            return json({ ok: true, grounded: false, limited: true, answer: "", sources: [], message: bkGateRes.message });
+          }
           if (messagesLeft(u, cfg, bkAdmin) <= 0) {
             return json({ ok: true, grounded: false, limited: true, answer: "", sources: [], message: cfg.limitStopMessage || "You've reached your usage limit for now." });
           }
           const bkRes = await bucketAsk(env, cfg, q, { form: body.form, subject: body.subject });
           if (bkRes.ok && bkRes.grounded && bkRes.answer) {
             const bkBudget = await enforceBudget(env, cfg, uid, u, bkRes.answer, 1, { type: "bucket" });
+            if (!bkAdmin) bucketCharge(u);
             await saveUser(env, uid, u);
             bkRes.answer = bkBudget.text;
             bkRes.cut = bkBudget.cut;
@@ -4913,6 +6203,544 @@ export default {
             if (bkWarn) bkRes.warning = bkWarn;
           }
           return json(bkRes);
+        }
+        case "/bucket/lesson": {
+          const lq = String(body.query || "").trim();
+          if (lq.length < 3) return json(friendly("Type your request first."), 400);
+          const lAdmin = uid === ADMIN_UID;
+          const lLim = await bucketLimits(env);
+          const gate = bucketGate(u, lLim, lAdmin);
+          if (gate.blocked) {
+            await saveUser(env, uid, u);
+            return json({ ok: true, kind: "limited", message: gate.message, left: 0, cap: gate.cap });
+          }
+          if (messagesLeft(u, cfg, lAdmin) <= 0) {
+            return json({ ok: true, kind: "limited", message: cfg.limitStopMessage || "You've reached your usage limit for now." });
+          }
+          const lProf = await teacherProfile(env, uid);
+          const lRes = await bucketLesson(env, cfg, lq, { form: body.form, subject: body.subject }, lProf);
+          if (lRes.ok && lRes.kind === "plan" && lRes.plan) {
+            const lBudget = await enforceBudget(env, cfg, uid, u, lRes.plan, 1, { type: "lesson" });
+            if (!lAdmin) bucketCharge(u);
+            await saveUser(env, uid, u);
+            lRes.plan = lBudget.text;
+            if (lBudget.cut) lRes.cut = true;
+            if (gate.cap > 0) {
+              const nowLeft = Math.max(0, gate.left - 1);
+              lRes.left = nowLeft; lRes.cap = gate.cap;
+              if (nowLeft <= (lLim.lessonWarnAt || 0)) {
+                lRes.warning = "You have " + nowLeft + " lesson plan" + (nowLeft === 1 ? "" : "s") + " left today. Resets in " + fmtReset(hoursToMidnightUTC()) + ".";
+              }
+            }
+            const lWarn = buildWarning(u, cfg, lAdmin);
+            if (lWarn && !lRes.warning) lRes.warning = lWarn;
+          }
+          return json(lRes);
+        }
+        // ---- ZAMA FOR TEACHERS ----
+        case "/teacher/profile": {
+          return json({ ok: true, profile: await teacherProfile(env, uid) });
+        }
+        case "/teacher/profile/save": {
+          return json({ ok: true, profile: await saveTeacherProfile(env, uid, body) });
+        }
+        case "/teacher/covered": {
+          const cov = await teacherMarkCovered(env, uid, body.subject, body.form, Array.isArray(body.topics) ? body.topics : String(body.topics || "").split(/,\s*/));
+          return json({ ok: true, covered: cov });
+        }
+        case "/teacher/chat": {
+          const tMsg = String(body.message || "").trim();
+          if (tMsg.length < 1) return json(friendly("Say something first."), 400);
+          const tAdmin = uid === ADMIN_UID;
+          const tLim = await bucketLimits(env);
+          const tProf = await teacherProfile(env, uid);
+          const tIntent = teacherIntent(tMsg);
+          // Small talk is free; real work counts against the daily limit.
+          const tCharge = (tIntent !== "greet" && tIntent !== "capability");
+          if (tCharge) {
+            const g = bucketGate(u, tLim, tAdmin, "lesson");
+            if (g.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: g.message }); }
+            if (messagesLeft(u, cfg, tAdmin) <= 0) return json({ ok: true, kind: "limited", message: cfg.limitStopMessage || "You've reached your usage limit for now." });
+            if (!isAdminUnlimited(tLim, tAdmin)) {
+              const ttk = tokenSpend(u, tLim, 1);
+              if (!ttk.ok) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: ttk.message }); }
+            }
+          }
+          const tRes = await teacherChat(env, cfg, tLim, uid, tProf, tMsg, body.history);
+          if (tRes.ok && tRes.text) {
+            const b = await enforceBudget(env, cfg, uid, u, tRes.text, 1, { type: "teacher" });
+            if (tCharge && !tAdmin) bucketCharge(u, "lesson");
+            await saveUser(env, uid, u);
+            tRes.text = b.text;
+            const w = buildWarning(u, cfg, tAdmin);
+            if (w) tRes.warning = w;
+          }
+          return json(tRes);
+        }
+        case "/teacher/coverage": {
+          const cAdmin = uid === ADMIN_UID;
+          const cLim = await bucketLimits(env);
+          const cg = bucketGate(u, cLim, cAdmin, "lesson");
+          if (cg.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: cg.message }); }
+          const cProf = await teacherProfile(env, uid);
+          const cRes = await teacherCoverage(env, cfg, cProf, body.subject, body.form);
+          if (cRes.ok && cRes.text) {
+            const b = await enforceBudget(env, cfg, uid, u, cRes.text, 1, { type: "coverage" });
+            if (!cAdmin) bucketCharge(u, "lesson");
+            await saveUser(env, uid, u);
+            cRes.text = b.text;
+          }
+          return json(cRes);
+        }
+
+        // ---- ZAMA FOR STUDENTS ----
+        case "/student/profile": {
+          const sp = await studentProfile(env, uid);
+          return json({ ok: true, profile: sp, readiness: readiness(sp), weak: weakTopics(sp, 5), due: dueTopics(sp, 5), daysToExam: daysToExam(sp) });
+        }
+        case "/student/profile/save": {
+          return json({ ok: true, profile: await saveStudentProfile(env, uid, body) });
+        }
+        case "/student/chat":
+        case "/student/practice":
+        case "/student/roadmap":
+        case "/student/report":
+        case "/student/mark": {
+          const sAdmin = uid === ADMIN_UID;
+          const sLim = await bucketLimits(env);
+          const sg = bucketGate(u, sLim, sAdmin, "study");
+          if (sg.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: sg.message }); }
+          if (messagesLeft(u, cfg, sAdmin) <= 0) return json({ ok: true, kind: "limited", message: cfg.limitStopMessage || "You've reached your usage limit for now." });
+          if (!isAdminUnlimited(sLim, sAdmin)) {
+            const stk = tokenSpend(u, sLim, 1);
+            if (!stk.ok) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: stk.message }); }
+          }
+          const sProf = await studentProfile(env, uid);
+          let sRes;
+          if (path === "/student/chat") {
+            const sm = String(body.message || "").trim();
+            if (sm.length < 1) return json(friendly("Say something first."), 400);
+            sRes = await studentChat(env, cfg, sLim, uid, sProf, sm, body.history);
+          } else if (path === "/student/practice") {
+            sRes = await studentPractice(env, cfg, sProf, body || {});
+          } else if (path === "/student/roadmap") {
+            sRes = await studentRoadmap(env, cfg, uid, sProf);
+          } else if (path === "/student/report") {
+            sRes = await studentReport(env, cfg, uid, sProf, body.audience);
+          } else {
+            sRes = await studentMark(env, cfg, uid, sProf, body.items);
+          }
+          if (sRes && sRes.ok) {
+            const payload = sRes.text || (sRes.questions ? JSON.stringify(sRes.questions) : "") || JSON.stringify(sRes.results || "");
+            if (payload) {
+              const b = await enforceBudget(env, cfg, uid, u, String(payload), 1, { type: "student" });
+              if (sRes.text) sRes.text = b.text;
+            }
+            if (!sAdmin && sRes.kind !== "clarify") bucketCharge(u, "study");
+            await saveUser(env, uid, u);
+            if (sg.cap > 0 && sRes.kind !== "clarify") { sRes.left = Math.max(0, sg.left - 1); sRes.cap = sg.cap; }
+          }
+          return json(sRes || { ok: false, error: "no result" });
+        }
+
+        // ---- TIMETABLE-DRIVEN LEARNING ----
+        case "/study/timetable": {
+          const tt = await timetableGet(env, uid);
+          return json({ ok: true, timetable: tt, now: timetableNow(tt), pending: pendingHomework(await homeworkList(env, uid)).length });
+        }
+        case "/study/timetable/save": {
+          const tt = await timetableSave(env, uid, body);
+          return json({ ok: true, timetable: tt, now: timetableNow(tt) });
+        }
+        case "/study/timetable/toggle": {
+          const cur = await timetableGet(env, uid);
+          const tt = await timetableSave(env, uid, { enabled: body.enabled === undefined ? !cur.enabled : body.enabled !== false });
+          return json({ ok: true, enabled: tt.enabled, timetable: tt,
+            message: tt.enabled ? "Timetable is back on. I'll follow your schedule." : "Timetable is off. Choose any subject and I'll continue from where we stopped in it." });
+        }
+        case "/study/timetable/suggest": {
+          const sgAdmin = uid === ADMIN_UID;
+          const sgBh = await bhConfig(env);
+          const sgGate = capGate(u, sgBh, sgAdmin, "study");
+          if (sgGate.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: sgGate.message }); }
+          const sgP = await studentProfile(env, uid);
+          const sys = bhPrompt(sgBh, "Help a Zambian student build a realistic weekly study timetable. Ask nothing - propose a draft they can edit. "
+            + 'Reply ONLY as JSON: {"lessonMinutes":15,"slots":[{"day":1,"start":"16:00","subject":"Mathematics","minutes":15}]} '
+            + "day: 0=Sunday..6=Saturday. Spread subjects evenly, keep sessions short, leave rest days.");
+          const r = await callStandard(env, arenaCfg(cfg, sgBh, "students"), [{ role: "system", content: sys },
+            { role: "user", content: "STUDENT: " + studentLine(sgP) + (body.preferences ? "\nPREFERENCES: " + String(body.preferences).slice(0, 600) : "") + "\n\nPropose the timetable." }], 900);
+          if (!r.ok) return json({ ok: false, error: r.error });
+          const o = parseJsonLoose(r.text) || {};
+          const slots = cleanSlots(o.slots);
+          if (!slots.length) return json({ ok: true, kind: "text", text: r.text });
+          if (!sgAdmin) capCharge(u, "study");
+          await saveUser(env, uid, u);
+          return json({ ok: true, kind: "draft", lessonMinutes: Math.max(3, Math.min(180, parseInt(o.lessonMinutes, 10) || LESSON_DEFAULT_MIN)), slots, note: "This is only a draft - save it to make it your timetable." });
+        }
+        case "/study/next": {
+          const nP = await studentProfile(env, uid);
+          const tt = await timetableGet(env, uid);
+          const hw = pendingHomework(await homeworkList(env, uid));
+          let sess = sessionTick(await sessionGet(env, uid), nowMs());
+          if (sess) await sessionSave(env, uid, sess);
+          const state = timetableNow(tt);
+          if (!tt.exists) {
+            return json({ ok: true, mode: "no-timetable", needsTimetable: true, pendingHomework: hw,
+              message: "You don't have a timetable yet. Shall we build one together, or would you rather study freely for now?" });
+          }
+          if (state.mode === "free") {
+            return json({ ok: true, mode: "free", pendingHomework: hw, subjects: nP.subjects || [], due: dueTopics(nP, 5),
+              message: "Your timetable is off, so choose any subject - I'll continue from exactly where we stopped in it." });
+          }
+          return json({ ok: true, mode: "timetable", current: state.current, next: state.next, pendingHomework: hw,
+            session: sess && sess.remainingMs > 0 ? { subject: sess.subject, remainingMs: sess.remainingMs, running: sess.running } : null,
+            message: state.current ? ("It's time for " + state.current.subject + ".") : (state.next ? ("Nothing scheduled right now. Next up: " + state.next.subject + " on " + state.next.dayName + " at " + state.next.start + ".") : "Nothing scheduled.") });
+        }
+        case "/study/session/start": {
+          const tt = await timetableGet(env, uid);
+          const state = timetableNow(tt);
+          let subject = String(body.subject || "").trim();
+          if (tt.enabled && tt.exists && !subject) subject = (state.current && state.current.subject) || "";
+          if (tt.enabled && tt.exists && state.current && subject && bkNorm(subject) !== bkNorm(state.current.subject) && body.override !== true) {
+            return json({ ok: true, kind: "off-timetable", scheduled: state.current.subject, requested: subject,
+              message: "Your timetable says " + state.current.subject + " right now. Study that, or send override to switch." });
+          }
+          if (!subject) return json(friendly("Which subject would you like to study?"), 400);
+          const minutes = Math.max(3, Math.min(180, parseInt(body.minutes, 10) || (state.current && state.current.minutes) || tt.lessonMinutes || LESSON_DEFAULT_MIN));
+          let sess = sessionTick(await sessionGet(env, uid), nowMs());
+          if (sess && sess.remainingMs > 0 && bkNorm(sess.subject) === bkNorm(subject)) {
+            sess.running = true; sess.lastTickAt = nowMs();
+            await sessionSave(env, uid, sess);
+            return json({ ok: true, resumed: true, subject: sess.subject, remainingMs: sess.remainingMs, lessonMs: sess.lessonMs, message: "Continuing your " + sess.subject + " lesson with " + Math.ceil(sess.remainingMs / 60000) + " minute(s) left." });
+          }
+          sess = { subject, grade: String(body.grade || "").trim(), lessonMs: minutes * 60000, remainingMs: minutes * 60000, running: true, startedAt: nowMs(), lastTickAt: nowMs() };
+          await sessionSave(env, uid, sess);
+          return json({ ok: true, started: true, subject, remainingMs: sess.remainingMs, lessonMs: sess.lessonMs });
+        }
+        case "/study/session/ping": {
+          let sess = await sessionGet(env, uid);
+          if (!sess) return json({ ok: true, session: null });
+          sess = sessionTick(sess, nowMs());
+          if (body.running === false) sess.running = false;
+          await sessionSave(env, uid, sess);
+          return json({ ok: true, subject: sess.subject, remainingMs: sess.remainingMs, running: sess.running, finished: sess.remainingMs <= 0 });
+        }
+        case "/study/session/pause": {
+          let sess = await sessionGet(env, uid);
+          if (!sess) return json({ ok: true, session: null });
+          sess = sessionTick(sess, nowMs()); sess.running = false;
+          await sessionSave(env, uid, sess);
+          return json({ ok: true, paused: true, subject: sess.subject, remainingMs: sess.remainingMs });
+        }
+        case "/study/session/end": {
+          let sess = await sessionGet(env, uid);
+          if (sess) {
+            sess = sessionTick(sess, nowMs());
+            const spent = Math.max(0, (sess.lessonMs || 0) - (sess.remainingMs || 0));
+            if (sess.subject) {
+              const pr = await progressGet(env, uid, sess.subject, sess.grade || "");
+              pr.timeMs = (pr.timeMs || 0) + spent;
+              await progressSave(env, uid, sess.subject, sess.grade || "", pr);
+            }
+            await fbDelete(env, "students/" + uid + "/session");
+            return json({ ok: true, ended: true, subject: sess.subject, studiedMs: spent });
+          }
+          return json({ ok: true, ended: true });
+        }
+        case "/study/lesson": {
+          const lAdmin2 = uid === ADMIN_UID;
+          const lBh2 = await bhConfig(env);
+          const lg2 = capGate(u, lBh2, lAdmin2, "study");
+          if (lg2.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: lg2.message }); }
+          const lP2 = await studentProfile(env, uid);
+          const tt2 = await timetableGet(env, uid);
+          let sess2 = sessionTick(await sessionGet(env, uid), nowMs());
+          const subject2 = String(body.subject || (sess2 && sess2.subject) || "").trim();
+          const grade2 = String(body.grade || lP2.grade || "").trim();
+          if (!subject2) return json(friendly("Which subject are we studying?"), 400);
+          if (sess2 && sess2.remainingMs <= 0) {
+            return json({ ok: true, kind: "time-up", subject: sess2.subject,
+              message: "That's the end of this " + sess2.subject + " session. We stopped at your current sub-topic and I'll resume exactly there next time." });
+          }
+          const res2 = await teachStep(env, cfg, lBh2, uid, lP2, subject2, grade2, { pace: tt2.pace });
+          if (res2 && res2.ok && res2.text) {
+            const b2 = await enforceBudget(env, cfg, uid, u, res2.text, 1, { type: "lesson" });
+            res2.text = b2.text;
+            if (!isAdminUnlimited(lBh2, lAdmin2)) capCharge(u, "study");
+            await saveUser(env, uid, u);
+            if (sess2) { sess2 = sessionTick(sess2, nowMs()); await sessionSave(env, uid, sess2); res2.remainingMs = sess2.remainingMs; }
+          }
+          return json(res2);
+        }
+        case "/study/advance": {
+          const subject3 = String(body.subject || "").trim();
+          const grade3 = String(body.grade || "").trim();
+          if (!subject3) return json(friendly("Which subject?"), 400);
+          const bh3 = await bhConfig(env);
+          const order3 = await syllabusOrder(env, cfg, bh3, subject3, grade3);
+          if (!order3.topics || !order3.topics.length) return json({ ok: false, error: NO_EVIDENCE });
+          let pr3 = await progressGet(env, uid, subject3, grade3);
+          const score3 = body.score === undefined ? 1 : Math.max(0, Math.min(1, Number(body.score)));
+          const place3 = placeInSyllabus(order3, pr3);
+          const sp3 = await studentProfile(env, uid);
+          updateMastery(sp3, subject3, place3.subtopic, score3);
+          await fbUpdate(env, "students/" + uid + "/profile", { mastery: sp3.mastery, updatedAt: nowMs() });
+          if (score3 < 0.6) {
+            return json({ ok: true, advanced: false, stayOn: place3.subtopic, message: "Let's stay on " + place3.subtopic + " a little longer and go over it again before moving on." });
+          }
+          pr3 = advancePlace(order3, pr3);
+          await progressSave(env, uid, subject3, grade3, pr3);
+          const nextPlace = placeInSyllabus(order3, pr3);
+          return json({ ok: true, advanced: true, completed: place3.subtopic, next: nextPlace ? { topic: nextPlace.topic, subtopic: nextPlace.subtopic } : null, finished: !!pr3.finished });
+        }
+        case "/study/progress": {
+          const subject4 = String(body.subject || "").trim();
+          const grade4 = String(body.grade || "").trim();
+          const sp4 = await studentProfile(env, uid);
+          if (!subject4) {
+            let all = null; try { all = await fbGet(env, "students/" + uid + "/progress"); } catch (e) {}
+            return json({ ok: true, subjects: all || {}, readiness: readiness(sp4), weak: weakTopics(sp4, 5), due: dueTopics(sp4, 5) });
+          }
+          const bh4 = await bhConfig(env);
+          const order4 = await syllabusOrder(env, cfg, bh4, subject4, grade4);
+          const pr4 = await progressGet(env, uid, subject4, grade4);
+          const place4 = placeInSyllabus(order4, pr4);
+          return json({ ok: true, subject: subject4, grade: grade4, place: place4, completed: (pr4.completedSubs || []).length,
+            totalTopics: (order4.topics || []).length, timeMinutes: Math.round((pr4.timeMs || 0) / 60000), mastery: readiness(sp4) });
+        }
+        case "/study/homework": {
+          const hwl = await homeworkList(env, uid);
+          return json({ ok: true, homework: hwl, pending: pendingHomework(hwl) });
+        }
+        case "/study/homework/give": {
+          return json({ ok: true, homework: await homeworkGive(env, uid, body) });
+        }
+        case "/study/homework/submit": {
+          const id5 = String(body.id || "");
+          if (!id5) return json(friendly("Which homework?"), 400);
+          await fbUpdate(env, "students/" + uid + "/homework/" + id5, { status: "submitted", submittedAt: nowMs(), answer: String(body.answer || "").slice(0, 6000) });
+          return json({ ok: true, submitted: id5, pending: pendingHomework(await homeworkList(env, uid)).length });
+        }
+        case "/study/homework/reschedule": {
+          const id6 = String(body.id || "");
+          if (!id6) return json(friendly("Which homework?"), 400);
+          await fbUpdate(env, "students/" + uid + "/homework/" + id6, { status: "rescheduled", dueAt: nowMs() + Math.max(1, parseInt(body.days, 10) || 1) * 86400000 });
+          return json({ ok: true, rescheduled: id6 });
+        }
+
+        // ---- ONBOARDING (#1, #11) ----
+        case "/onboard/next": {
+          const role = body.role === "teacher" ? "teacher" : "student";
+          const prof = role === "teacher" ? await teacherProfile(env, uid) : await studentProfile(env, uid);
+          return json(Object.assign({ ok: true, role }, onboardNext(prof, role)));
+        }
+        case "/onboard/answer": {
+          const role = body.role === "teacher" ? "teacher" : "student";
+          let prof = role === "teacher" ? await teacherProfile(env, uid) : await studentProfile(env, uid);
+          const step = onboardNext(prof, role);
+          const field = String(body.field || step.field || "");
+          const answer = String(body.answer || "").trim();
+          if (!field) return json({ ok: true, complete: true });
+          if (!answer) return json(friendly("Please answer the question first."), 400);
+          const patch = {}; patch[field] = answer;
+          prof = role === "teacher" ? await saveTeacherProfile(env, uid, patch) : await saveStudentProfile(env, uid, patch);
+          return json(Object.assign({ ok: true, role, saved: field }, onboardNext(prof, role)));
+        }
+
+        // ---- MEMORY (#2, #3) ----
+        case "/memory/list": {
+          const role = body.role === "teacher" ? "teacher" : "student";
+          return json({ ok: true, memories: await memoryLoad(env, role, uid) });
+        }
+        case "/memory/forget": {
+          const role = body.role === "teacher" ? "teacher" : "student";
+          if (body.id) { await fbDelete(env, memPath(role, uid) + "/" + String(body.id)); return json({ ok: true }); }
+          if (body.all === true) { await fbDelete(env, memPath(role, uid)); return json({ ok: true, cleared: true }); }
+          return json(friendly("Nothing specified to forget."), 400);
+        }
+        case "/student/nudges": {
+          const np = await studentProfile(env, uid);
+          return json({ ok: true, nudges: proactiveNudges(np, await memoryLoad(env, "student", uid)), readiness: readiness(np), due: dueTopics(np, 5) });
+        }
+
+        // ---- ASSESSMENT CARDS (#19) ----
+        case "/student/assessment": {
+          const aAdmin = uid === ADMIN_UID;
+          const aBh = await bhConfig(env);
+          const capName = ASSESS_TYPES[String(body.type || "")] ? (body.type === "mock" ? "mock" : body.type === "essay" ? "essay" : "assessment") : "assessment";
+          const ag = capGate(u, aBh, aAdmin, capName);
+          if (ag.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: ag.message }); }
+          const tk = tokenSpend(u, aBh, 1);
+          if (!tk.ok) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: tk.message }); }
+          const aProf = await studentProfile(env, uid);
+          const aRes = await buildAssessment(env, arenaCfg(cfg, aBh, "students"), aBh, aProf, body);
+          if (aRes && aRes.ok && aRes.kind !== "clarify") { if (!isAdminUnlimited(aBh, aAdmin)) capCharge(u, capName); await saveUser(env, uid, u); if (ag.cap > 0) { aRes.left = Math.max(0, ag.left - 1); aRes.cap = ag.cap; } }
+          return json(aRes);
+        }
+
+        // ---- TEACHER GUIDANCE (#20) ----
+        case "/teacher/insights": {
+          const iAdmin = uid === ADMIN_UID;
+          const iBh = await bhConfig(env);
+          const ig = capGate(u, iBh, iAdmin, "lesson");
+          if (ig.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: ig.message }); }
+          const iProf = await teacherProfile(env, uid);
+          const iRes = await teacherInsights(env, arenaCfg(cfg, iBh, "teachers"), iBh, iProf, body);
+          if (iRes && iRes.ok && iRes.text) { if (!isAdminUnlimited(iBh, iAdmin)) capCharge(u, "lesson"); await saveUser(env, uid, u); }
+          return json(iRes);
+        }
+
+        // ---- DOCK SKILLS (#10) ----
+        case "/bucket/skills": {
+          const sBh = await bhConfig(env);
+          return json({ ok: true, skills: bhSkills(sBh) });
+        }
+        case "/bucket/skills/save": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const sBh = await bhConfig(env, true);
+          const skills = Object.assign({}, sBh.skills || {});
+          const name = String(body.name || "").trim();
+          if (!name) return json(friendly("Which skill?"), 400);
+          skills[name] = Object.assign({}, skills[name] || {}, {
+            enabled: body.enabled !== false,
+            label: String(body.label || (BH_SKILL_DEFAULTS[name] && BH_SKILL_DEFAULTS[name].label) || name).slice(0, 60),
+            kind: String(body.kind || "").slice(0, 20),
+            instruction: String(body.instruction || "").slice(0, 900)
+          });
+          const saved = await bhSave(env, { skills });
+          return json({ ok: true, skills: bhSkills(saved) });
+        }
+        case "/bucket/skill/run": {
+          const rAdmin = uid === ADMIN_UID;
+          const rBh = await bhConfig(env);
+          const rg = capGate(u, rBh, rAdmin, "message");
+          if (rg.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: rg.message }); }
+          const rRole = body.role === "teacher" ? "teacher" : "student";
+          const rProf = rRole === "teacher" ? await teacherProfile(env, uid) : await studentProfile(env, uid);
+          const rRes = await runSkill(env, arenaCfg(cfg, rBh, rRole === "teacher" ? "teachers" : "students"), rBh, String(body.skill || ""), body, rRole === "teacher" ? teacherLine(rProf) : studentLine(rProf));
+          if (rRes && rRes.ok && rRes.text) { if (!isAdminUnlimited(rBh, rAdmin)) capCharge(u, "message"); await saveUser(env, uid, u); }
+          return json(rRes);
+        }
+
+        // ---- VERIFIED EXAM PATTERNS (#8) ----
+        case "/bucket/patterns": {
+          return json(await examPatterns(env, String(body.subject || ""), String(body.grade || body.form || ""), body.source === "test" ? "test" : "ecz"));
+        }
+
+        // ---- BUCKET HOUSE CONFIG: master prompt, arenas, caps, tokens (#9,#12,#14,#18) ----
+        case "/bucket/config": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const c = await bhConfig(env, true);
+          return json({ ok: true, config: c, capNames: Object.keys(c.caps), skills: bhSkills(c) });
+        }
+        case "/bucket/config/save": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const patch = {};
+          if (body.systemPrompt !== undefined) patch.systemPrompt = String(body.systemPrompt).slice(0, 6000);
+          if (body.adminUnlimited !== undefined) patch.adminUnlimited = body.adminUnlimited !== false;
+          if (body.caps && typeof body.caps === "object") patch.caps = body.caps;
+          if (body.arenas && typeof body.arenas === "object") patch.arenas = body.arenas;
+          if (body.tokens && typeof body.tokens === "object") patch.tokens = body.tokens;
+          const saved = await bhSave(env, patch);
+          return json({ ok: true, config: saved });
+        }
+
+        // ---- MEMBERSHIP (#13) ----
+        case "/admin/membership": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const target = await resolveUid(env, body.identifier);
+          if (!target) return json({ ok: false, error: "Couldn't find that user. Try their UID, or ask them to sign in once so their email is indexed." });
+          const applied = await setMembership(env, target, body.plan === "paid" ? "paid" : "free", body.days);
+          return json({ ok: true, uid: target, applied });
+        }
+        case "/admin/membership/lookup": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const target = await resolveUid(env, body.identifier);
+          if (!target) return json({ ok: false, error: "Not found." });
+          let tu = null; try { tu = await fbGet(env, "users/" + target); } catch (e) {}
+          return json({ ok: true, uid: target, plan: (tu && tu.plan) || "free", paidUntil: (tu && tu.paidUntil) || 0 });
+        }
+
+        // ---- USAGE DASHBOARD (#16) ----
+        case "/usage/dashboard": {
+          const dBh = await bhConfig(env);
+          const dAdmin = uid === ADMIN_UID;
+          const unlimited = isAdminUnlimited(dBh, dAdmin);
+          const tok = tokenState(u, dBh);
+          const items = Object.keys(dBh.caps).map(k => {
+            const c = dBh.caps[k];
+            const cap = (u.plan === "paid") ? c.paid : c.free;
+            const slot = (u.caps && u.caps[k] && u.caps[k].day === dayKey()) ? u.caps[k] : { n: 0 };
+            const used = slot.n || 0;
+            return { key: k, label: c.label || k, enabled: c.enabled !== false, unlimited: unlimited || !cap || cap <= 0,
+              cap: cap || 0, used, left: cap ? Math.max(0, cap - used) : null, percent: cap ? Math.min(100, Math.round((used / cap) * 100)) : 0 };
+          });
+          await saveUser(env, uid, u);
+          return json({ ok: true, plan: u.plan || "free", admin: dAdmin, adminUnlimited: unlimited,
+            resetInSeconds: tok.enabled ? tok.resetInSeconds : Math.round(hoursToMidnightUTC() * 3600),
+            tokens: tok.enabled ? { daily: tok.dailyAllowance, dailyLeft: tok.dailyLeft, weekly: tok.weeklyAllowance, weeklyLeft: tok.weeklyLeft, perRequest: tok.perRequest,
+              dailyPercent: tok.dailyAllowance ? Math.round(((tok.dailyAllowance - tok.dailyLeft) / tok.dailyAllowance) * 100) : 0,
+              weeklyPercent: tok.weeklyAllowance ? Math.round(((tok.weeklyAllowance - tok.weeklyLeft) / tok.weeklyAllowance) * 100) : 0 } : { enabled: false },
+            capabilities: items });
+        }
+
+        // ---- PROFESSIONAL DOCUMENTS (#22) ----
+        case "/doc/generate": {
+          const gAdmin = uid === ADMIN_UID;
+          const gBh = await bhConfig(env);
+          const gg = capGate(u, gBh, gAdmin, "document");
+          if (gg.blocked) { await saveUser(env, uid, u); return json({ ok: true, kind: "limited", message: gg.message }); }
+          let md = String(body.content || "").trim();
+          const title = String(body.title || "Document").slice(0, 140);
+          if (!md) {
+            const prompt = String(body.prompt || "").trim();
+            if (prompt.length < 3) return json(friendly("What should the document contain?"), 400);
+            const hits = await bucketSmart(env, prompt, { form: body.form, subject: body.subject }, 6);
+            const sys = bhPrompt(gBh, "Write a professional educational document in clean markdown: ## headings, **bold** labels, - bullets, and tables where useful. "
+              + (hits.length ? "Ground it on the CONTEXT." : "Do not claim to quote the syllabus."));
+            const r = await callStandard(env, cfg, [{ role: "system", content: sys }, { role: "user", content: (hits.length ? "CONTEXT:\n" + bkContext(hits) + "\n\n" : "") + "DOCUMENT REQUEST: " + prompt }], 1900);
+            if (!r.ok) return json({ ok: false, error: r.error || "generation failed" });
+            const b = await enforceBudget(env, cfg, uid, u, r.text, 1, { type: "document" });
+            md = b.text;
+          }
+          const id = "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+          const html = docHtml(title, String(body.subtitle || "").slice(0, 200), md, { kind: String(body.kind || "Document").slice(0, 40), school: String(body.school || "").slice(0, 80), author: String(body.author || "").slice(0, 80) });
+          await fbSet(env, "shared/" + id, { title, plan: md, html: true, by: uid, at: nowMs(), subtitle: String(body.subtitle || "").slice(0, 200), kind: String(body.kind || "Document").slice(0, 40) });
+          if (!isAdminUnlimited(gBh, gAdmin)) capCharge(u, "document");
+          await saveUser(env, uid, u);
+          return json({ ok: true, id, url: url.origin + "/share?id=" + id, markdown: md, html });
+        }
+
+        case "/bucket/limits": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          return json({ ok: true, limits: await bucketLimits(env) });
+        }
+        case "/bucket/limits/save": {
+          if (uid !== ADMIN_UID) return json(friendly("Admin only."), 403);
+          const cur = await bucketLimits(env);
+          const num = (v, d) => { const n = parseInt(v, 10); return isNaN(n) ? d : Math.max(0, Math.min(100000, n)); };
+          const next = {
+            lessonsEnabled: body.lessonsEnabled !== false,
+            lessonDailyFree: num(body.lessonDailyFree, cur.lessonDailyFree),
+            lessonDailyPaid: num(body.lessonDailyPaid, cur.lessonDailyPaid),
+            lessonWarnAt: num(body.lessonWarnAt, cur.lessonWarnAt),
+            studentsEnabled: body.studentsEnabled !== false,
+            studyDailyFree: num(body.studyDailyFree, cur.studyDailyFree),
+            studyDailyPaid: num(body.studyDailyPaid, cur.studyDailyPaid),
+            offMessage: String(body.offMessage || cur.offMessage).slice(0, 300),
+            limitMessage: String(body.limitMessage || cur.limitMessage).slice(0, 300),
+            studyOffMessage: String(body.studyOffMessage || cur.studyOffMessage).slice(0, 300),
+            studyLimitMessage: String(body.studyLimitMessage || cur.studyLimitMessage).slice(0, 300)
+          };
+          await fbSet(env, "bucketConfig", next);
+          return json({ ok: true, limits: next });
+        }
+        case "/bucket/publish": {
+          const pPlan = String(body.plan || "").trim();
+          if (pPlan.length < 20) return json(friendly("Nothing to publish yet."), 400);
+          const pid = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+          await fbSet(env, "shared/" + pid, { title: String(body.title || "Lesson plan").slice(0, 140), plan: pPlan.slice(0, 60000), by: uid, at: nowMs() });
+          return json({ ok: true, id: pid, url: url.origin + "/share?id=" + pid });
         }
         case "/skills/peek": {
           // Live-status ticker support: skill NAMES and half previews only.
