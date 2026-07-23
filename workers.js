@@ -5036,7 +5036,7 @@ function parseJsonLoose(s) {
    covered, so plans fit THAT school and that class - and can compare
    what has been taught against the official syllabus.
    ============================================================ */
-const TEACHER_FIELDS = ["name", "school", "district", "province", "subjects", "forms", "classes", "learners", "covered", "termEndsAt", "notes"];
+const TEACHER_FIELDS = ["name", "school", "district", "province", "subjects", "forms", "classes", "learners", "covered", "termEndsAt", "notes", "lessonsCovered", "currentLessons", "instructions"];
 async function teacherProfile(env, uid) {
   let p = null;
   try { p = await fbGet(env, "teachers/" + uid); } catch (e) {}
@@ -5052,8 +5052,14 @@ async function saveTeacherProfile(env, uid, body) {
   TEACHER_FIELDS.forEach(k => { if (body[k] !== undefined && body[k] !== null) patch[k] = body[k]; });
   if (patch.subjects && !Array.isArray(patch.subjects)) patch.subjects = String(patch.subjects).split(/,\s*/).filter(Boolean);
   if (patch.forms && !Array.isArray(patch.forms)) patch.forms = String(patch.forms).split(/,\s*/).filter(Boolean);
-  ["classes", "learners"].forEach(k => { if (patch[k] !== undefined) { const n = parseInt(patch[k], 10); patch[k] = isNaN(n) ? null : Math.max(0, Math.min(10000, n)); } });
-  ["name", "school", "district", "province", "notes"].forEach(k => { if (patch[k] !== undefined) patch[k] = String(patch[k]).slice(0, 160); });
+  ["classes", "learners"].forEach(k => {
+    if (patch[k] !== undefined) {
+      const digits = String(patch[k]).replace(/[^0-9]/g, "");   // "about 50 learners" -> 50
+      const n = digits ? parseInt(digits, 10) : 0;
+      patch[k] = isNaN(n) ? 0 : Math.max(0, Math.min(10000, n));
+    }
+  });
+  ["name", "school", "district", "province", "notes", "lessonsCovered", "currentLessons", "instructions"].forEach(k => { if (patch[k] !== undefined) patch[k] = String(patch[k]).slice(0, 600); });
   const next = Object.assign({}, p, patch, { updatedAt: nowMs() });
   await fbUpdate(env, "teachers/" + uid, next);
   return next;
@@ -5186,7 +5192,7 @@ async function studentProfile(env, uid) {
 async function saveStudentProfile(env, uid, body) {
   const p = await studentProfile(env, uid);
   const patch = {};
-  ["name", "grade", "school", "goals", "career", "language"].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]).slice(0, 160); });
+  ["name", "grade", "school", "goals", "career", "language", "lessonsCovered", "lessonsCurrent", "examBoard", "hardSubjects", "likedSubjects", "learningStyle", "about"].forEach(k => { if (body[k] !== undefined) patch[k] = String(body[k]).slice(0, 600); });
   if (body.subjects !== undefined) patch.subjects = Array.isArray(body.subjects) ? body.subjects : String(body.subjects).split(/,\s*/).filter(Boolean);
   if (body.examDate !== undefined) patch.examDate = String(body.examDate).slice(0, 20);
   if (body.studyMinutes !== undefined) { const n = parseInt(body.studyMinutes, 10); patch.studyMinutes = isNaN(n) ? null : Math.max(0, Math.min(1440, n)); }
@@ -6538,13 +6544,34 @@ export default {
           const role = body.role === "teacher" ? "teacher" : "student";
           let prof = role === "teacher" ? await teacherProfile(env, uid) : await studentProfile(env, uid);
           const step = onboardNext(prof, role);
-          const field = String(body.field || step.field || "");
-          const answer = String(body.answer || "").trim();
-          if (!field) return json({ ok: true, complete: true });
+          if (step.complete) return json({ ok: true, role, complete: true, answered: step.answered, total: step.total });
+          // Always trust the SERVER's current step, never a stale field from the client.
+          const field = step.field;
+          let answer = String(body.answer || "").trim();
           if (!answer) return json(friendly("Please answer the question first."), 400);
+          if (/^(skip|none|no|n\/a|nothing|-)$/i.test(answer)) answer = "—";
           const patch = {}; patch[field] = answer;
           prof = role === "teacher" ? await saveTeacherProfile(env, uid, patch) : await saveStudentProfile(env, uid, patch);
-          return json(Object.assign({ ok: true, role, saved: field }, onboardNext(prof, role)));
+          let next = onboardNext(prof, role);
+          // Safety net: if the answer somehow didn't stick, store it directly so the
+          // teacher/student can never be trapped repeating the same question.
+          if (!next.complete && next.field === field) {
+            const direct = {}; direct[field] = answer;
+            const profPath = role === "teacher" ? ("teachers/" + uid) : ("students/" + uid + "/profile");
+            await fbUpdate(env, profPath, direct);
+            prof = role === "teacher" ? await teacherProfile(env, uid) : await studentProfile(env, uid);
+            next = onboardNext(prof, role);
+            if (!next.complete && next.field === field) {
+              // Still stuck - skip this question rather than block the person.
+              next = { complete: false, field: null, question: null, answered: step.answered + 1, total: step.total, skipped: field };
+              const fields = onboardFields(role);
+              const idx = fields.findIndex(f => f.k === field);
+              const following = fields.slice(idx + 1).find(f => !onboardFilled(prof, f.k));
+              if (following) { next.field = following.k; next.question = following.q; }
+              else next = { complete: true, answered: step.total, total: step.total };
+            }
+          }
+          return json(Object.assign({ ok: true, role, saved: field }, next));
         }
 
         // ---- MEMORY (#2, #3) ----
